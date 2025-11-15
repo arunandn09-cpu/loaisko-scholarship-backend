@@ -3,28 +3,44 @@ const nodemailer = require('nodemailer');
 
 // --- 🎯 NODEMAILER SETUP (Reading from secure environment variables) ---
 // IMPORTANT: These variables must be set on your Render Dashboard
-const SENDER_EMAIL = process.env.SMTP_USER; 
-const GMAIL_APP_PASSWORD = process.env.SMTP_PASS;
+// New variables align with Resend (SMTP_USER is now NODEMAILER_USER, etc.)
 
-if (!SENDER_EMAIL || !GMAIL_APP_PASSWORD) {
-    console.error("❌ CRITICAL: SMTP_USER or SMTP_PASS environment variables are not set. Email functions will fail.");
-    // Exit or throw error if configuration is critical, or just warn if testing locally without env vars
+// NOTE: We are reading the new, specific variable names from the environment.
+const NODEMAILER_USER = process.env.NODEMAILER_USER; // Should be 'resend'
+const NODEMAILER_PASS = process.env.NODEMAILER_PASS; // Should be the Resend API Key
+const NODEMAILER_HOST = process.env.NODEMAILER_HOST; // Should be 'smtp.resend.com'
+const NODEMAILER_PORT = process.env.NODEMAILER_PORT; // Should be 465
+const SENDER_EMAIL = process.env.SENDER_EMAIL; // Should be "LoA Scholarship Portal" <onboarding@resend.dev>
+
+if (!NODEMAILER_USER || !NODEMAILER_PASS || !NODEMAILER_HOST || !SENDER_EMAIL) {
+    console.error("❌ CRITICAL: One or more Resend environment variables (USER, PASS, HOST, SENDER_EMAIL) are not set. Email functions will fail.");
+    // In a production app, you might crash the process here to avoid silent failures.
 }
 
+// -------------------------------------------------------------------------
+//                         RESEND TRANSPORTER CONFIG
+// -------------------------------------------------------------------------
+
 const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true, 
+    host: NODEMAILER_HOST, // Use the host you set on Render (smtp.resend.com)
+    port: NODEMAILER_PORT, // Use the port you set on Render (465)
+    
+    // IMPORTANT: Resend recommends port 465 with secure: true
+    secure: NODEMAILER_PORT == 465, 
+    
     auth: {
-        user: SENDER_EMAIL,
-        pass: GMAIL_APP_PASSWORD 
+        // NODEMAILER_USER should be 'resend'
+        user: NODEMAILER_USER, 
+        // NODEMAILER_PASS should be the Resend API Key
+        pass: NODEMAILER_PASS 
     },
-    // Adding tls setting for potential security issues, though 'secure: true' usually handles this.
+    // The tls setting is usually not needed when secure: true is set, but keeping 
+    // it in place with rejectUnauthorized: false can sometimes help in cloud environments.
     tls: {
         rejectUnauthorized: false
     }
 });
-// ------------------------------------------------------------
+// -------------------------------------------------------------------------
 
 
 /**
@@ -53,7 +69,10 @@ async function sendVerificationEmail(recipientEmail, verificationCode, verificat
     const verificationLink = `${baseUrl}/api/verify-link?token=${verificationToken}&email=${recipientEmail}`;
 
     const mailOptions = {
-        from: `Scholarship Portal <${SENDER_EMAIL}>`,
+        // --- 🎯 CRITICAL CHANGE: Using the environment variable SENDER_EMAIL ---
+        // This will be "LoA Scholarship Portal" <onboarding@resend.dev>
+        from: SENDER_EMAIL, 
+        // ----------------------------------------------------------------------
         to: recipientEmail,
         subject: 'Verify Your Scholarship Portal Account',
         html: `
@@ -77,6 +96,7 @@ async function sendVerificationEmail(recipientEmail, verificationCode, verificat
         console.log(`✉️ Verification email sent to ${recipientEmail}:`, info.response);
         return true;
     } catch (error) {
+        // Note: The error message is often cleaner when the connection works
         console.error(`❌ CRITICAL VERIFICATION EMAIL SEND FAILURE to ${recipientEmail}:`, error.message);
         return false;
     }
@@ -105,8 +125,8 @@ async function sendApplicationStatusEmail(recipientEmail, studentName, scholarsh
             primaryColor = '#4CAF50';
             headerText = 'Congratulations!';
             bodyContent = `<p>We are pleased to inform you that your application for the <b>${scholarshipType}</b> has been **APPROVED!**</p>
-                           <p>You can now log in to the portal to view the details of your award, including the final calculated discount amount.</p>
-                           <p>Please follow the next steps outlined in the portal or contact the administration office.</p>`;
+                            <p>You can now log in to the portal to view the details of your award, including the final calculated discount amount.</p>
+                            <p>Please follow the next steps outlined in the portal or contact the administration office.</p>`;
             break;
 
         case 'rejected':
@@ -114,8 +134,8 @@ async function sendApplicationStatusEmail(recipientEmail, studentName, scholarsh
             primaryColor = '#F44336';
             headerText = 'Application Update';
             bodyContent = `<p>We regret to inform you that your application for the <b>${scholarshipType}</b> has been **REJECTED** at this time.</p>
-                           <p>You may check the portal for further details or criteria, or contact the administration for clarification.</p>
-                           <p>We encourage you to apply again next term if eligible.</p>`;
+                            <p>You may check the portal for further details or criteria, or contact the administration for clarification.</p>
+                            <p>We encourage you to apply again next term if eligible.</p>`;
             break;
             
         case 'cancelled':
@@ -123,7 +143,7 @@ async function sendApplicationStatusEmail(recipientEmail, studentName, scholarsh
             primaryColor = '#FF9800'; // Orange for warning/cancellation
             headerText = 'Application Status Change';
             bodyContent = `<p>This is to confirm that the status of your application for the <b>${scholarshipType}</b> has been updated to **CANCELLED**.</p>
-                           <p>This action may have been performed by the administration or by yourself. If you believe this is an error, please contact the administration office immediately.</p>`;
+                            <p>This action may have been performed by the administration or by yourself. If you believe this is an error, please contact the administration office immediately.</p>`;
             break;
 
         case 'pending':
@@ -132,12 +152,14 @@ async function sendApplicationStatusEmail(recipientEmail, studentName, scholarsh
             primaryColor = '#2196F3'; // Blue for informational
             headerText = 'Application Status Change';
             bodyContent = `<p>This is to confirm that the status of your application for the <b>${scholarshipType}</b> has been updated to **PENDING**.</p>
-                           <p>Your application is currently being reviewed. You will receive another email notification when a final decision has been made.</p>`;
+                            <p>Your application is currently being reviewed. You will receive another email notification when a final decision has been made.</p>`;
             break;
     }
 
     const mailOptions = {
-        from: `Scholarship Portal <${SENDER_EMAIL}>`,
+        // --- 🎯 CRITICAL CHANGE: Using the environment variable SENDER_EMAIL ---
+        from: SENDER_EMAIL,
+        // ----------------------------------------------------------------------
         to: recipientEmail,
         subject: subject,
         html: `

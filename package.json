@@ -21,7 +21,8 @@
     "jsonwebtoken": "^9.0.2",
     "mongodb": "^6.20.0",
     "nodemailer": "^7.0.10",
-    "nodemailer-smtp-transport": "^2.4.2"
+    "nodemailer-smtp-transport": "^2.4.2",
+    "resend": "^6.4.2"
   },
   "description": "",
   "devDependencies": {

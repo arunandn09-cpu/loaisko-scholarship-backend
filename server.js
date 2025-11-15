@@ -6,16 +6,25 @@ const admin = require('firebase-admin');
 const firebase = require('firebase/app'); 
 const crypto = require('crypto');
 
+// 🔑 IMPORT NEW EMAIL SERVICE (Backend-only Nodemailer)
+const { 
+    generateVerificationCode, 
+    sendVerificationEmail, 
+    sendApplicationStatusEmail 
+} = require('./emailService'); 
+
 // --- 1. CORE EXPRESS INITIALIZATION ---
 const app = express();
-const PORT = process.env.PORT || 10000; // Updated Port to 10000 for consistency with logs
-const BASE_URL = process.env.PUBLIC_URL || 'https://loaiskoportal.web.app'; 
+const PORT = process.env.PORT || 10000;
+// CRITICAL: BASE_URL must be the API's own URL for the verification link.
+// It reads from PUBLIC_URL (Render env var) or defaults to local.
+const BASE_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`; 
 // --- END CORE SETUP ---
 
 // --- 2. CONFIGURATION / MIDDLEWARE ---
 app.use(cors({
     origin: [
-        'https://loaiskoportal.web.app', // Your deployed frontend
+        'https://loaiskoportal.web.app', // Your deployed frontend (Firebase Hosting)
         `http://localhost:3000`,      // Common local development port
         'http://127.0.0.1:3000'          // Common local address
     ],
@@ -25,19 +34,20 @@ app.use(cors({
 app.use(express.json()); 
 
 // 🎯 MONGO DB CONFIG
-const uri = process.env.MONGO_URI || "mongodb+srv://ar09_db_userunandn:k6tBypac5gDjylF0@loaiskoportalemailverif.6awvwxe.mongodb.net/?appName=LOAISKOPORTALEmailVerification"; 
+// FIX: Ensure you read MONGO_URI from env.
+const uri = process.env.MONGO_URI; 
 const DB_NAME = "scholarship_db"; 
 const STUDENTS_COLLECTION = "students"; 
 const APPLICATIONS_COLLECTION = "applications"; 
 
 const saltRounds = 10;
-const client = new MongoClient(uri);
+// Only create client if URI is available.
+const client = uri ? new MongoClient(uri) : null; 
 let studentsCollection; 
 let applicationsCollection; 
 
 
 // --- 3. FIREBASE ADMIN INITIALIZATION (SECURE KEY LOADING) ---
-// This uses the FIREBASE_SERVICE_ACCOUNT environment variable set in Render.
 try {
     const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT;
     let serviceAccount;
@@ -57,15 +67,11 @@ try {
         console.log("✅ Firebase Admin SDK initialized.");
     }
 } catch (error) {
-    // This catches the 'invalid_grant' error from the old key!
     console.error("❌ Firebase Admin Initialization Failed. Ensure 'FIREBASE_SERVICE_ACCOUNT' environment variable is set and the key is valid.", error.message);
 }
 
 
 // --- 4. FIREBASE/FIRESTORE SYNC UTILITY (No Change) ---
-/**
- * Utility function to sync a verified user to Firebase Auth and Firestore 'students' collection.
- */
 async function syncUserToFirebase(user) {
     const { studentNo, email, firstName, middleInitial, lastName, role, course, yearLevel } = user;
     let firebaseUid = studentNo; 
@@ -130,22 +136,12 @@ async function syncUserToFirebase(user) {
 }
 // -------------------------------------------------------------------------------------
 
-
-// 🔑 RE-INCORPORATED: Verification code generation function
-function generateVerificationCode() {
-    // Generate a 6-digit code for users to manually enter
-    const code = Math.floor(100000 + Math.random() * 900000).toString();
-    // Generate a secure, unique token for email link verification
-    const token = crypto.randomBytes(32).toString('hex');
-    return { code, token };
-}
-
-
-// --- 5. MIDDLEWARE DEFINITIONS (No Change) ---
+// --- 5. MIDDLEWARE DEFINITIONS ---
 const checkDbConnection = (req, res, next) => {
-    if (!studentsCollection || !applicationsCollection) { 
-        console.error("❌ Database collection is not ready. Server may still be connecting.");
-        return res.status(503).json({ success: false, message: "Server initializing or database unavailable. Please try again in a moment." });
+    // Check if client object is null (if MONGO_URI was missing)
+    if (!studentsCollection || !applicationsCollection || !client) { 
+        console.error("❌ Database connection is not ready or MONGO_URI is missing.");
+        return res.status(503).json({ success: false, message: "Server initializing or database unavailable. Please ensure MONGO_URI is set." });
     }
     next();
 };
@@ -161,8 +157,7 @@ const verifyAdmin = async (req, res, next) => {
 
 /**
  * POST /api/register 
- * 🎯 ACTION: Backend prepares verification data (code/token) and returns it.
- * Client then calls SendGrid using this data.
+ * 🎯 ACTION: Backend handles email dispatch using the imported service.
  */
 app.post('/api/register', async (req, res) => {
     const { firstName, middleInitial, lastName, studentNo, course, yearLevel, email, password } = req.body;
@@ -172,14 +167,12 @@ app.post('/api/register', async (req, res) => {
     }
 
     try {
-        // Check if studentNo is already registered
         const existingStudent = await studentsCollection.findOne({ studentNo });
         if (existingStudent) {
             console.warn(`⚠️ Blocked registration attempt: Student No ${studentNo} already registered.`);
             return res.status(409).json({ success: false, message: '**Student Number already registered**. Please check your Student Number or log in.' });
         }
 
-        // Check if email is already registered
         const existingUser = await studentsCollection.findOne({ email });
         if (existingUser) {
             return res.status(409).json({ success: false, message: 'This email is already registered. Please log in.' });
@@ -187,6 +180,7 @@ app.post('/api/register', async (req, res) => {
         
         const hashedPassword = await bcrypt.hash(password, saltRounds);
         
+        // Use imported function to generate code/token
         const { code, token } = generateVerificationCode(); 
 
         const newUserDocument = {
@@ -202,15 +196,24 @@ app.post('/api/register', async (req, res) => {
 
         await studentsCollection.insertOne(newUserDocument);
         
-        console.log(`✅ User registered (pending verification): ${email}. Verification data prepared for client.`);
+        // 🔑 Nodemailer ACTION: Send the verification email from the backend
+        const emailSent = await sendVerificationEmail(email, code, token, BASE_URL);
+
+        if (!emailSent) {
+            // Log error but still succeed the registration, asking user to resend later
+            console.warn(`⚠️ Email failed to send for ${email}. Registration recorded, but user must use resend. `);
+            return res.status(202).json({ 
+                success: true, 
+                message: `Registration successful, but verification email failed to send. Please use the resend code feature.`
+            });
+        }
         
-        // 🔑 RESPONSE: Return all required data for client-side SendGrid call
+        console.log(`✅ User registered and verification email dispatched: ${email}.`);
+        
+        // SUCCESS RESPONSE: Notify user that the email was sent (No token/code returned)
         res.json({ 
             success: true, 
-            message: `Registration successful. Data returned for client-side verification email dispatch.`,
-            recipientEmail: email,
-            verificationToken: token,
-            verificationCode: code
+            message: `Registration successful. A verification email has been sent to ${email}.`
         });
 
     } catch (error) {
@@ -308,7 +311,7 @@ app.post('/api/login-and-sync', async (req, res) => {
  */
 app.post('/api/verify-code', async (req, res) => {
     const { email, code } = req.body;
-// ... (The rest of /api/verify-code is unchanged as it only handles database updates and sync)
+
     if (!email || !code) {
         return res.status(400).json({ success: false, message: "Email and verification code are required." });
     }
@@ -393,7 +396,7 @@ app.get('/api/verify-link', async (req, res) => {
 
         console.log(`✅ Account verified by link: ${email}`);
         
-        // Redirect the user to a success page or provide a friendly message
+        // Display HTML success message
         res.status(200).send(`
             <!DOCTYPE html>
             <html>
@@ -424,8 +427,7 @@ app.get('/api/verify-link', async (req, res) => {
 
 /**
  * POST /api/resend-code
- * 🎯 ACTION: Backend prepares NEW verification data (code/token) and returns it.
- * Client then calls SendGrid using this data.
+ * 🎯 ACTION: Backend handles email dispatch using the imported service.
  */
 app.post('/api/resend-code', async (req, res) => {
     const { email } = req.body;
@@ -444,6 +446,7 @@ app.post('/api/resend-code', async (req, res) => {
             return res.json({ success: true, message: "Account is already verified. Please log in." });
         }
         
+        // Use imported function
         const { code: newCode, token: newToken } = generateVerificationCode();
         
         // Update user document with new code/token and expiration
@@ -457,16 +460,26 @@ app.post('/api/resend-code', async (req, res) => {
                 }
             }
         );
-
-        console.log(`✉️ Resent verification data prepared for client: ${email}`);
         
-        // 🔑 RESPONSE: Return all required data for client-side SendGrid call
+        // 🔑 Nodemailer ACTION: Send the verification email from the backend
+        const emailSent = await sendVerificationEmail(email, newCode, newToken, BASE_URL);
+        
+        if (!emailSent) {
+            // Log error but still succeed the database update
+            console.warn(`⚠️ Resend email failed to send for ${email}. Database updated, but user must try again. `);
+            return res.status(202).json({ 
+                success: true, 
+                message: `Verification code updated, but email failed to send. Please try the resend feature again in a moment.`
+            });
+        }
+
+
+        console.log(`✉️ New verification email dispatched: ${email}`);
+        
+        // SUCCESS RESPONSE: Notify user that the email was sent (No token/code returned)
         res.json({ 
             success: true, 
-            message: `New verification data returned for client-side email dispatch.`,
-            recipientEmail: email,
-            verificationToken: newToken,
-            verificationCode: newCode
+            message: `New verification email has been sent to ${email}.`
         });
 
     } catch (error) {
@@ -548,6 +561,10 @@ async function initializeServer() {
     serverInitialized = true;
 
     try {
+        if (!uri) {
+             throw new Error("MONGO_URI environment variable is missing. Cannot connect to MongoDB.");
+        }
+        
         console.log("Connecting to MongoDB...");
         await client.connect();
         const db = client.db(DB_NAME);
@@ -558,8 +575,7 @@ async function initializeServer() {
 
         app.listen(PORT, () => {
             console.log(`🚀 Server listening on port ${PORT}.`);
-            console.log(`Access endpoint via: ${BASE_URL} (if deployed) or http://localhost:${PORT} (if local)`);
-            console.log(`Remember to run 'node server.js' to keep this running!`);
+            console.log(`BASE_URL used for verification links: ${BASE_URL}`);
         });
     } catch (error) {
         console.error("❌ Fatal Error: Failed to connect to MongoDB or start server.", error);
@@ -567,9 +583,11 @@ async function initializeServer() {
     }
 
     process.on('SIGINT', async () => {
-        console.log('\n🛑 Server shutting down. Closing MongoDB connection...');
-        await client.close();
-        console.log('✅ MongoDB connection closed.');
+        if (client) {
+            console.log('\n🛑 Server shutting down. Closing MongoDB connection...');
+            await client.close();
+            console.log('✅ MongoDB connection closed.');
+        }
         process.exit(0);
     });
 }

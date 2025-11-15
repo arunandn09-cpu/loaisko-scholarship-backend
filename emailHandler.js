@@ -1,6 +1,6 @@
 // --- 🚨 SENDGRID CREDENTIALS & CONSTANTS ---
 // 🚨 1. PASTE YOUR COPIED RESTRICTED SENDGRID API KEY HERE
-const SENDGRID_API_KEY = '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'; 
+const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY;
 const FROM_EMAIL = 'loaiskoscholarship@gmail.com'; 
 const DEPLOYED_URL = 'https://loaiskoportal.web.app'; 
 // ------------------------------------------

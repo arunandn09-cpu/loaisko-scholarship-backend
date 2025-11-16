@@ -26,11 +26,10 @@ const allowedOrigins = [
     'http://localhost:8080', // Common development port
     // ✅ CRITICAL FIX: Add your Firebase Hosting domains here
     'https://loaiskoportal.web.app',
-    'https://loaiskoportal.firebaseapp.com', 
-    process.env.FRONTEND_URL // Use environment variable for the deployed frontend URL
+    'https://loaiskoportal.firebaseapp.com',
 ];
 
-// 🔄 UPDATED CORS CONFIGURATION
+// 🔄 UPDATED CORS CONFIGURATION (Keeping this, but relying on manual override for the specific route)
 app.use(cors({
     origin: (origin, callback) => {
         // Allow requests with no origin (like mobile apps or curl requests)
@@ -187,17 +186,36 @@ const verifyAdmin = async (req, res, next) => {
 
 // --- 9. API ENDPOINTS (Routes) ---
 
+// 🚀 CRITICAL CORS FIX START 🚀
+/**
+ * 🔑 MANUAL CORS HANDLER: OPTIONS /api/firebase-config
+ * Responds to the browser's preflight request with the necessary headers.
+ */
+app.options('/api/firebase-config', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', 'https://loaiskoportal.web.app');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type'); // Add any custom headers if needed
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.sendStatus(200); // Send success status for preflight
+});
+
 /**
  * 🔑 NEW SECURE ROUTE: GET /api/firebase-config
  * Serves the public client Firebase configuration to the frontend dynamically.
  */
 app.get('/api/firebase-config', (req, res) => {
+    // ⬇️ CRITICAL FIX: Manually set CORS headers for the GET request ⬇️
+    res.setHeader('Access-Control-Allow-Origin', 'https://loaiskoportal.web.app');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    
     if (!FIREBASE_CLIENT_CONFIG.apiKey) {
         console.error("❌ Firebase client config is missing API key. Check environment variables.");
         return res.status(500).json({ success: false, message: "Configuration error." });
     }
     res.json(FIREBASE_CLIENT_CONFIG);
 });
+// 🚀 CRITICAL CORS FIX END 🚀
 
 
 /**

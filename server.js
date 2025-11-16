@@ -1,77 +1,87 @@
+// server.js
+
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb'); 
 const bcrypt = require('bcrypt');
-const admin = require('firebase-admin'); 
 const firebase = require('firebase/app'); 
-const crypto = require('crypto');
 
-// 🔑 IMPORT NEW EMAIL SERVICE (Backend-only Nodemailer)
-const { 
-    generateVerificationCode, 
-    sendVerificationEmail, 
-    sendApplicationStatusEmail 
-} = require('./emailService'); 
+// 🎯 SECURE IMPORT: Imports the initialized Admin SDK using environment variables
+const admin = require('./firebaseAdmin'); 
+
+// ✅ UPDATED IMPORT: Uses the new Firebase-based verification function
+const { sendFirebaseVerificationEmail, sendApplicationStatusEmail } = require('./emailService'); 
 
 // --- 1. CORE EXPRESS INITIALIZATION ---
 const app = express();
-const PORT = process.env.PORT || 10000;
-// CRITICAL: BASE_URL must be the API's own URL for the verification link.
-// It reads from PUBLIC_URL (Render env var) or defaults to local.
-const BASE_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`; 
+// Use environment variable for PORT in production
+const PORT = process.env.PORT || 3000; 
 // --- END CORE SETUP ---
 
 // --- 2. CONFIGURATION / MIDDLEWARE ---
+// Use dynamic CORS setup to allow access from various origins during development/deployment
+const allowedOrigins = [
+    'http://localhost:3000', // Default Express port
+    'http://localhost:5500', // Default Live Server port
+    'http://localhost:8080', // Common development port
+    process.env.FRONTEND_URL // Use environment variable for the deployed frontend URL
+];
+
+// 🔄 UPDATED CORS CONFIGURATION
 app.use(cors({
-    origin: [
-        'https://loaiskoportal.web.app', // Your deployed frontend (Firebase Hosting)
-        `http://localhost:3000`,      // Common local development port
-        'http://127.0.0.1:3000'          // Common local address
-    ],
+    origin: (origin, callback) => {
+        // Allow requests with no origin (like mobile apps or curl requests)
+        if (!origin) return callback(null, true);
+        if (allowedOrigins.includes(origin) || origin.endsWith('.onrender.com')) {
+            return callback(null, true);
+        }
+        // NOTE: We're allowing any origin ending in '.onrender.com' for flexibility.
+        callback(new Error('Not allowed by CORS'));
+    },
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
     credentials: true,
-})); 
+}));
+
 app.use(express.json()); 
 
-// 🎯 MONGO DB CONFIG
-// FIX: Ensure you read MONGO_URI from env.
-const uri = process.env.MONGO_URI; 
+// Serve static files from the 'public' folder
+app.use(express.static('public'));
+
+// 🎯 MONGO DB CONFIG (Using Environment Variable is HIGHLY Recommended for URI)
+// NOTE: For Render, you should set a MONGO_URI environment variable.
+const uri = process.env.MONGO_URI || "mongodb+srv://ar09_db_userunandn:k6tBypac5gDjylF0@loaiskoportalemailverif.6awvwxe.mongodb.net/?appName=LOAISKOPORTALEmailVerification"; 
 const DB_NAME = "scholarship_db"; 
 const STUDENTS_COLLECTION = "students"; 
 const APPLICATIONS_COLLECTION = "applications"; 
 
 const saltRounds = 10;
-// Only create client if URI is available.
-const client = uri ? new MongoClient(uri) : null; 
+const client = new MongoClient(uri);
 let studentsCollection; 
 let applicationsCollection; 
 
 
-// --- 3. FIREBASE ADMIN INITIALIZATION (SECURE KEY LOADING) ---
-try {
-    const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT;
-    let serviceAccount;
-
-    if (serviceAccountJson) {
-        // Parse the JSON string from the environment variable (for Render deployment)
-        serviceAccount = JSON.parse(serviceAccountJson);
-    } else {
-        // Fallback for local development (requires local file)
-        serviceAccount = require('./firebase-adminsdk.json');
-    }
-    
-    if (!admin.apps.length) {
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount)
-        });
-        console.log("✅ Firebase Admin SDK initialized.");
-    }
-} catch (error) {
-    console.error("❌ Firebase Admin Initialization Failed. Ensure 'FIREBASE_SERVICE_ACCOUNT' environment variable is set and the key is valid.", error.message);
-}
+// 🔑 FIREBASE CLIENT CONFIGURATION (PUBLIC & SAFE TO EXPOSE)
+// These should be configured as environment variables in your Render service.
+const FIREBASE_CLIENT_CONFIG = {
+    apiKey: process.env.FIREBASE_PUBLIC_API_KEY,
+    authDomain: process.env.FIREBASE_AUTH_DOMAIN,
+    projectId: process.env.FIREBASE_PROJECT_ID,
+    storageBucket: process.env.FIREBASE_STORAGE_BUCKET, 
+    messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID,
+    appId: process.env.FIREBASE_APP_ID,
+    measurementId: process.env.FIREBASE_MEASUREMENT_ID 
+};
 
 
-// --- 4. FIREBASE/FIRESTORE SYNC UTILITY (No Change) ---
+// --- 5. FIREBASE ADMIN INITIALIZATION ---
+// The initialization logic has been moved entirely to ./firebaseAdmin.js
+// The imported 'admin' object above is already initialized.
+
+
+// --- 6. FIREBASE/FIRESTORE SYNC UTILITY (Remains the same) ---
+/**
+ * Utility function to sync a verified user to Firebase Auth and Firestore 'students' collection.
+ */
 async function syncUserToFirebase(user) {
     const { studentNo, email, firstName, middleInitial, lastName, role, course, yearLevel } = user;
     let firebaseUid = studentNo; 
@@ -91,7 +101,7 @@ async function syncUserToFirebase(user) {
         if (error.code === 'auth/user-not-found') {
             try {
                 const newUser = await admin.auth().createUser({
-                    uid: studentNo, // Use studentNo as the UID for linking!
+                    uid: studentNo, 
                     email: email,
                     emailVerified: true,
                     displayName: `${firstName} ${lastName}`,
@@ -119,11 +129,17 @@ async function syncUserToFirebase(user) {
         const studentProfileRef = firestoreDb.collection('students').doc(firebaseUid); 
         
         await studentProfileRef.set({
-            firebaseUid: firebaseUid,
+            firebaseUid: firebaseUid, 
             studentNo: studentNo, 
-            firstName, middleInitial, lastName, email, course, yearLevel, role,
+            firstName,
+            middleInitial,
+            lastName,
+            email, 
+            course,
+            yearLevel,
+            role,
             verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
+        }, { merge: true }); 
         
         console.log(`✅ Synced student profile to Firestore 'students' collection for UID ${firebaseUid}.`);
 
@@ -132,101 +148,143 @@ async function syncUserToFirebase(user) {
         throw new Error(`Firestore profile synchronization failed: ${firestoreError.message}`); 
     }
 
-    return firebaseUid;
+    return firebaseUid; 
 }
 // -------------------------------------------------------------------------------------
 
-// --- 5. MIDDLEWARE DEFINITIONS ---
+
+// --- 8. MIDDLEWARE DEFINITIONS ---
+
+// Middleware to check if the database connection is ready
 const checkDbConnection = (req, res, next) => {
-    // Check if client object is null (if MONGO_URI was missing)
-    if (!studentsCollection || !applicationsCollection || !client) { 
-        console.error("❌ Database connection is not ready or MONGO_URI is missing.");
-        return res.status(503).json({ success: false, message: "Server initializing or database unavailable. Please ensure MONGO_URI is set." });
+    if (!studentsCollection || !applicationsCollection) { 
+        console.error("❌ Database collection is not ready. Server may still be connecting.");
+        return res.status(503).json({ success: false, message: "Server initializing or database unavailable. Please try again in a moment." });
     }
     next();
 };
+
+// Apply DB connection check to all API routes
 app.use('/api', checkDbConnection);
 
+
+// 🛡️ ADMIN MIDDLEWARE (PLACEHOLDER - SHOULD VERIFY FIREBASE ID TOKEN ROLE) 🛡️
 const verifyAdmin = async (req, res, next) => {
+    // ⚠️ TODO: Implement real token verification and role check here using Firebase Admin SDK:
+    // const idToken = req.headers.authorization.split('Bearer ')[1];
+    // const decodedToken = await admin.auth().verifyIdToken(idToken);
+    // if (decodedToken.role !== 'admin') { return res.status(403).json(...) }
+    
     console.log("[Middleware Placeholder] Admin authentication assumed successful.");
     return next();
 };
 
 
-// --- 6. API ENDPOINTS (Routes) ---
+// --- 9. API ENDPOINTS (Routes) ---
 
 /**
- * POST /api/register 
- * 🎯 ACTION: Backend handles email dispatch using the imported service.
+ * 🔑 NEW SECURE ROUTE: GET /api/firebase-config
+ * Serves the public client Firebase configuration to the frontend dynamically.
+ */
+app.get('/api/firebase-config', (req, res) => {
+    if (!FIREBASE_CLIENT_CONFIG.apiKey) {
+        console.error("❌ Firebase client config is missing API key. Check environment variables.");
+        return res.status(500).json({ success: false, message: "Configuration error." });
+    }
+    res.json(FIREBASE_CLIENT_CONFIG);
+});
+
+
+/**
+ * POST /api/register (Updated for Firebase Auth)
  */
 app.post('/api/register', async (req, res) => {
     const { firstName, middleInitial, lastName, studentNo, course, yearLevel, email, password } = req.body;
 
     if (!email || !password || !studentNo) {
         return res.status(400).json({ success: false, message: "Email, password, and Student Number are required." });
-    }
+        }
 
     try {
+        // Check if studentNo is already registered
         const existingStudent = await studentsCollection.findOne({ studentNo });
         if (existingStudent) {
             console.warn(`⚠️ Blocked registration attempt: Student No ${studentNo} already registered.`);
             return res.status(409).json({ success: false, message: '**Student Number already registered**. Please check your Student Number or log in.' });
         }
 
+        // Check if email is already registered
         const existingUser = await studentsCollection.findOne({ email });
         if (existingUser) {
             return res.status(409).json({ success: false, message: 'This email is already registered. Please log in.' });
         }
         
+        // --- 1. Create User in Firebase Auth First (Best Practice) ---
+        const firebaseUser = await admin.auth().createUser({
+            uid: studentNo, // Enforce studentNo as the UID
+            email: email,
+            password: password, // Temp password for Auth, will be checked against Hashed password in Mongo on login
+            displayName: `${firstName} ${lastName}`,
+            emailVerified: false, 
+        });
+        
+        // --- 2. Save Hashed Password and User Details to MongoDB ---
         const hashedPassword = await bcrypt.hash(password, saltRounds);
         
-        // Use imported function to generate code/token
-        const { code, token } = generateVerificationCode(); 
-
         const newUserDocument = {
             firstName, middleInitial, lastName, studentNo, course, yearLevel, email,
             password: hashedPassword,
             role: "student",
-            isVerified: false, 
-            verificationCode: code, 
-            verificationToken: token, 
-            codeExpires: new Date(Date.now() + 15 * 60 * 1000), // 15 mins
+            isVerified: false, // Remains false until the link is clicked
             createdAt: new Date(),
         };
 
         await studentsCollection.insertOne(newUserDocument);
         
-        // 🔑 Nodemailer ACTION: Send the verification email from the backend
-        const emailSent = await sendVerificationEmail(email, code, token, BASE_URL);
+        // --- 3. Send verification email via Firebase Service ---
+        const frontendRedirectUrl = process.env.FRONTEND_VERIFICATION_URL; 
+        
+        if (!frontendRedirectUrl) {
+             // Rollback: Delete user from Firebase Auth and Mongo
+             await admin.auth().deleteUser(firebaseUser.uid); 
+             await studentsCollection.deleteOne({ email }); 
+             return res.status(500).json({ success: false, message: "Server configuration error: FRONTEND_VERIFICATION_URL is missing. Registration failed." });
+        }
 
+        const emailSent = await sendFirebaseVerificationEmail(email, frontendRedirectUrl); 
+        
         if (!emailSent) {
-            // Log error but still succeed the registration, asking user to resend later
-            console.warn(`⚠️ Email failed to send for ${email}. Registration recorded, but user must use resend. `);
-            return res.status(202).json({ 
-                success: true, 
-                message: `Registration successful, but verification email failed to send. Please use the resend code feature.`
-            });
+            console.error(`❌ FAILED to send verification email for ${email}. Deleting user.`);
+            // Rollback: Delete user from Firebase Auth and Mongo
+            await admin.auth().deleteUser(firebaseUser.uid); 
+            await studentsCollection.deleteOne({ email }); 
+            return res.status(500).json({ success: false, message: "Registration failed: Could not send verification email. Please try again later." });
         }
         
-        console.log(`✅ User registered and verification email dispatched: ${email}.`);
+        console.log(`✅ User registered (pending verification): ${email}`);
         
-        // SUCCESS RESPONSE: Notify user that the email was sent (No token/code returned)
         res.json({ 
             success: true, 
-            message: `Registration successful. A verification email has been sent to ${email}.`
+            message: `Registration successful. A verification link has been sent to your email (${email}). Please check your inbox to verify your account and log in.` 
         });
 
     } catch (error) {
         console.error("❌ Registration Failed:", error);
         
+        // Handle MongoDB duplicate key error 
         if (error.code === 11000) {
             let detail = 'A user with this email or student number already exists.';
             if (error.message.includes('studentNo')) {
-                detail = 'The **Student Number** is already registered.';
+                 detail = 'The **Student Number** is already registered.';
             } else if (error.message.includes('email')) {
-                detail = 'The Email is already registered.';
+                 detail = 'The Email is already registered.';
             }
             return res.status(409).json({ success: false, message: detail });
+        }
+
+        // Handle Firebase Auth errors (e.g., email-already-in-use)
+        if (error.code && error.code.startsWith('auth/')) {
+            return res.status(409).json({ success: false, message: `Registration failed (Auth): ${error.message}` });
         }
         
         res.status(500).json({ success: false, message: "Server error during registration" });
@@ -235,7 +293,7 @@ app.post('/api/register', async (req, res) => {
 
 
 /**
- * POST /api/login-and-sync (No Change)
+ * POST /api/login-and-sync (Remains functional for MongoDB login check)
  */
 app.post('/api/login-and-sync', async (req, res) => {
     const { email, password } = req.body;
@@ -251,12 +309,13 @@ app.post('/api/login-and-sync', async (req, res) => {
             return res.status(401).json({ success: false, message: "Invalid email or password." }); 
         }
         
+        // Verification check (Still relies on MongoDB's isVerified flag)
         if (!user.isVerified) {
             console.warn(`⚠️ Blocked login: User ${email} is not verified.`);
             return res.status(403).json({ 
                 success: false, 
                 message: "Account is not verified. Redirecting to verification page.",
-                needsVerification: true
+                needsVerification: true 
             });
         }
 
@@ -266,17 +325,20 @@ app.post('/api/login-and-sync', async (req, res) => {
             return res.status(401).json({ success: false, message: "Invalid email or password." }); 
         }
 
+        // 1. Sync user data and get the final Firebase UID used
         let firebaseUid;
 
         try {
             firebaseUid = await syncUserToFirebase(user); 
             
+            // 2. Generate custom token using the determined UID
             const customToken = await admin.auth().createCustomToken(firebaseUid);
 
 
+            // 3. Final successful response
             const profileData = {
                 studentNo: user.studentNo,
-                firebaseUid: firebaseUid,
+                firebaseUid: firebaseUid, 
                 firstName: user.firstName,
                 lastName: user.lastName,
                 email: user.email,
@@ -287,7 +349,7 @@ app.post('/api/login-and-sync', async (req, res) => {
                 success: true, 
                 message: "Login successful.", 
                 user: profileData,
-                token: customToken
+                token: customToken // 🔑 CRITICAL: This sends the token to the client.
             });
 
 
@@ -307,129 +369,9 @@ app.post('/api/login-and-sync', async (req, res) => {
 
 
 /**
- * POST /api/verify-code (No Change)
+ * POST /api/resend-verification (Updated for Firebase Auth link generation)
  */
-app.post('/api/verify-code', async (req, res) => {
-    const { email, code } = req.body;
-
-    if (!email || !code) {
-        return res.status(400).json({ success: false, message: "Email and verification code are required." });
-    }
-
-    try {
-        const user = await studentsCollection.findOne({ email });
-
-        if (!user) {
-            return res.status(404).json({ success: false, message: "User not found." });
-        }
-        if (user.isVerified) {
-            return res.json({ success: true, message: "Account is already verified." });
-        }
-
-        const currentTime = new Date();
-
-        if (user.verificationCode !== code) {
-            return res.status(401).json({ success: false, message: "Invalid verification code." });
-        }
-
-        if (user.codeExpires && user.codeExpires < currentTime) {
-            return res.status(401).json({ success: false, message: "Verification code has expired. Please request a new one." });
-        }
-
-        // 1. Verification successful: Update MongoDB
-        await studentsCollection.updateOne(
-            { email },
-            { $set: { isVerified: true }, $unset: { verificationCode: "", verificationToken: "", codeExpires: "" } }
-        );
-
-        // 2. Retrieve the verified user object (important for sync function)
-        const verifiedUser = await studentsCollection.findOne({ email }); 
-        
-        // 3. Sync user to Firebase Auth and Firestore 
-        if (verifiedUser) {
-            await syncUserToFirebase(verifiedUser); 
-        }
-
-        console.log(`✅ Account verified by code: ${email}`);
-        res.json({ success: true, message: "Account verified successfully! You can now log in." });
-
-    } catch (error) {
-        console.error("❌ Code Verification Failed:", error);
-        res.status(500).json({ success: false, message: `Server error during code verification and user synchronization: ${error.message}` });
-    }
-});
-
-
-/**
- * GET /api/verify-link (No Change)
- */
-app.get('/api/verify-link', async (req, res) => {
-    const { token, email } = req.query;
-
-    if (!token || !email) {
-        return res.status(400).send("Verification failed. Missing token or email.");
-    }
-
-    try {
-        const user = await studentsCollection.findOne({ email });
-
-        if (!user || user.verificationToken !== token) {
-            return res.status(401).send("Verification failed. Invalid or expired link.");
-        }
-        if (user.isVerified) {
-            return res.send("Account is already verified. You can now log in to the portal.");
-        }
-        
-        // 1. Verification successful: Update MongoDB
-        await studentsCollection.updateOne(
-            { email },
-            { $set: { isVerified: true }, $unset: { verificationCode: "", verificationToken: "", codeExpires: "" } }
-        );
-
-        // 2. Retrieve the verified user object 
-        const verifiedUser = await studentsCollection.findOne({ email });
-
-        // 3. Sync user to Firebase Auth and Firestore 
-        if (verifiedUser) {
-            await syncUserToFirebase(verifiedUser);
-        }
-
-        console.log(`✅ Account verified by link: ${email}`);
-        
-        // Display HTML success message
-        res.status(200).send(`
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Verification Success</title>
-                <style>
-                    body { font-family: sans-serif; text-align: center; padding: 50px; }
-                    h1 { color: #4CAF50; }
-                    .container { max-width: 500px; margin: 0 auto; border: 1px solid #ddd; padding: 30px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.1); }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>✅ Account Verified Successfully!</h1>
-                    <p>Your email address (${email}) has been confirmed.</p>
-                    <p>You can now close this window and log in to the Scholarship Portal.</p>
-                </div>
-            </body>
-            </html>
-        `);
-
-    } catch (error) {
-        console.error("❌ Link Verification Failed:", error);
-        res.status(500).send(`Server error during link verification and user synchronization: ${error.message}`);
-    }
-});
-
-
-/**
- * POST /api/resend-code
- * 🎯 ACTION: Backend handles email dispatch using the imported service.
- */
-app.post('/api/resend-code', async (req, res) => {
+app.post('/api/resend-verification', async (req, res) => {
     const { email } = req.body;
 
     if (!email) {
@@ -446,51 +388,64 @@ app.post('/api/resend-code', async (req, res) => {
             return res.json({ success: true, message: "Account is already verified. Please log in." });
         }
         
-        // Use imported function
-        const { code: newCode, token: newToken } = generateVerificationCode();
-        
-        // Update user document with new code/token and expiration
-        await studentsCollection.updateOne(
-            { email },
-            { 
-                $set: { 
-                    verificationCode: newCode, 
-                    verificationToken: newToken,
-                    codeExpires: new Date(Date.now() + 15 * 60 * 1000) // 15 mins
-                }
-            }
-        );
-        
-        // 🔑 Nodemailer ACTION: Send the verification email from the backend
-        const emailSent = await sendVerificationEmail(email, newCode, newToken, BASE_URL);
-        
-        if (!emailSent) {
-            // Log error but still succeed the database update
-            console.warn(`⚠️ Resend email failed to send for ${email}. Database updated, but user must try again. `);
-            return res.status(202).json({ 
-                success: true, 
-                message: `Verification code updated, but email failed to send. Please try the resend feature again in a moment.`
-            });
+        const frontendRedirectUrl = process.env.FRONTEND_VERIFICATION_URL; 
+        if (!frontendRedirectUrl) {
+            return res.status(500).json({ success: false, message: "Server configuration error: FRONTEND_VERIFICATION_URL is missing." });
         }
 
+        // Use the Firebase service to send a new verification link
+        const emailSent = await sendFirebaseVerificationEmail(email, frontendRedirectUrl);
 
-        console.log(`✉️ New verification email dispatched: ${email}`);
-        
-        // SUCCESS RESPONSE: Notify user that the email was sent (No token/code returned)
-        res.json({ 
-            success: true, 
-            message: `New verification email has been sent to ${email}.`
-        });
+        if (!emailSent) {
+            return res.status(500).json({ success: false, message: "Failed to send new verification email. Check server logs." });
+        }
+
+        console.log(`✉️ Resent Firebase verification link to ${email}`);
+        res.json({ success: true, message: `A new verification link has been sent to ${email}.` });
 
     } catch (error) {
-        console.error("❌ Resend Code Failed:", error);
-        res.status(500).json({ success: false, message: "Server error during resend code operation." });
+        console.error("❌ Resend Link Failed:", error);
+        res.status(500).json({ success: false, message: "Server error during resend verification operation." });
     }
 });
 
 
 /**
- * DELETE /api/admin/delete-student (No Change)
+ * POST /api/send-status-email (Remains functional for status updates)
+ */
+app.post('/api/send-status-email', verifyAdmin, async (req, res) => {
+    const { docId, status, email, name, scholarshipType } = req.body; 
+
+    if (!status || !email || !name || !scholarshipType) {
+        return res.status(400).json({ 
+            success: false, 
+            message: "Missing required fields: status, email, name, and scholarshipType are needed to send confirmation." 
+        });
+    }
+
+    try {
+        const emailSent = await sendApplicationStatusEmail(email, name, scholarshipType, status);
+
+        if (!emailSent) {
+            console.error(`❌ FAILED to send ${status} email to ${email}.`);
+            return res.status(500).json({ success: false, message: `Failed to send confirmation email for status ${status}.` });
+        }
+
+        console.log(`✅ Status confirmation email sent for Application ${docId} (Status: ${status}) to ${email}.`);
+        res.json({ 
+            success: true, 
+            message: `Confirmation email for status ${status} successfully sent to ${email}.` 
+        });
+
+    } catch (error) {
+        console.error("❌ Failed to process status email request:", error);
+        res.status(500).json({ success: false, message: "Internal server error while attempting to send email." });
+    }
+});
+
+
+/**
+ * DELETE /api/admin/delete-student (Remains the same)
  */
 app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
     const { studentNo, email } = req.body;
@@ -551,9 +506,13 @@ app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
 });
 
 
-// --- 7. INITIALIZATION ---
+// --- 10. INITIALIZATION ---
+
 let serverInitialized = false; 
 
+/**
+ * Connects to the database and starts the Express server.
+ */
 async function initializeServer() {
     if (serverInitialized) {
         return; 
@@ -561,10 +520,6 @@ async function initializeServer() {
     serverInitialized = true;
 
     try {
-        if (!uri) {
-             throw new Error("MONGO_URI environment variable is missing. Cannot connect to MongoDB.");
-        }
-        
         console.log("Connecting to MongoDB...");
         await client.connect();
         const db = client.db(DB_NAME);
@@ -574,8 +529,7 @@ async function initializeServer() {
         console.log("✅ MongoDB successfully connected and collections ready.");
 
         app.listen(PORT, () => {
-            console.log(`🚀 Server listening on port ${PORT}.`);
-            console.log(`BASE_URL used for verification links: ${BASE_URL}`);
+            console.log(`🚀 Server running on http://localhost:${PORT}`);
         });
     } catch (error) {
         console.error("❌ Fatal Error: Failed to connect to MongoDB or start server.", error);
@@ -583,14 +537,12 @@ async function initializeServer() {
     }
 
     process.on('SIGINT', async () => {
-        if (client) {
-            console.log('\n🛑 Server shutting down. Closing MongoDB connection...');
-            await client.close();
-            console.log('✅ MongoDB connection closed.');
-        }
+        console.log('\n🛑 Server shutting down. Closing MongoDB connection...');
+        await client.close();
+        console.log('✅ MongoDB connection closed.');
         process.exit(0);
     });
 }
 
-// Start the initialization process 
+// Start the initialization process (ONLY ONE CALL IS REQUIRED)
 initializeServer();

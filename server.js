@@ -19,17 +19,18 @@ const PORT = process.env.PORT || 3000;
 // --- END CORE SETUP ---
 
 // --- 2. CONFIGURATION / MIDDLEWARE ---
-// Use dynamic CORS setup to allow access from various origins during development/deployment
+
+// 🛑 CRITICAL FIX: Comment out the global CORS middleware to ensure it does not interfere 
+// with the manual headers applied to the /api/firebase-config route.
+/*
 const allowedOrigins = [
     'http://localhost:3000', // Default Express port
     'http://localhost:5500', // Default Live Server port
     'http://localhost:8080', // Common development port
-    // ✅ CRITICAL FIX: Add your Firebase Hosting domains here
     'https://loaiskoportal.web.app',
     'https://loaiskoportal.firebaseapp.com',
 ];
 
-// 🔄 UPDATED CORS CONFIGURATION (Keeping this, but relying on manual override for the specific route)
 app.use(cors({
     origin: (origin, callback) => {
         // Allow requests with no origin (like mobile apps or curl requests)
@@ -45,7 +46,9 @@ app.use(cors({
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
     credentials: true,
 }));
+*/
 
+// Middleware for parsing request bodies
 app.use(express.json()); 
 
 // Serve static files from the 'public' folder
@@ -77,9 +80,7 @@ const FIREBASE_CLIENT_CONFIG = {
 };
 
 
-// --- 5. FIREBASE ADMIN INITIALIZATION ---
-// The initialization logic has been moved entirely to ./firebaseAdmin.js
-// The imported 'admin' object above is already initialized.
+// --- 5. FIREBASE ADMIN INITIALIZATION (Handled in firebaseAdmin.js) ---
 
 
 // --- 6. FIREBASE/FIRESTORE SYNC UTILITY (Remains the same) ---
@@ -192,6 +193,7 @@ const verifyAdmin = async (req, res, next) => {
  * Responds to the browser's preflight request with the necessary headers.
  */
 app.options('/api/firebase-config', (req, res) => {
+    // These must match the frontend URL exactly, as defined in index.html's fetch.
     res.setHeader('Access-Control-Allow-Origin', 'https://loaiskoportal.web.app');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type'); // Add any custom headers if needed

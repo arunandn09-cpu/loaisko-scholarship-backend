@@ -24,6 +24,9 @@ const allowedOrigins = [
     'http://localhost:3000', // Default Express port
     'http://localhost:5500', // Default Live Server port
     'http://localhost:8080', // Common development port
+    // ✅ CRITICAL FIX: Add your Firebase Hosting domains here
+    'https://loaiskoportal.web.app',
+    'https://loaiskoportal.firebaseapp.com', 
     process.env.FRONTEND_URL // Use environment variable for the deployed frontend URL
 ];
 
@@ -32,11 +35,13 @@ app.use(cors({
     origin: (origin, callback) => {
         // Allow requests with no origin (like mobile apps or curl requests)
         if (!origin) return callback(null, true);
+        
+        // Allow specific origins and any origin ending in '.onrender.com' for flexibility.
         if (allowedOrigins.includes(origin) || origin.endsWith('.onrender.com')) {
             return callback(null, true);
         }
-        // NOTE: We're allowing any origin ending in '.onrender.com' for flexibility.
-        callback(new Error('Not allowed by CORS'));
+        
+        callback(new Error(`Not allowed by CORS: ${origin}`));
     },
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE',
     credentials: true,
@@ -101,7 +106,7 @@ async function syncUserToFirebase(user) {
         if (error.code === 'auth/user-not-found') {
             try {
                 const newUser = await admin.auth().createUser({
-                    uid: studentNo, 
+                    uid: studentNo, // Enforce studentNo as the UID
                     email: email,
                     emailVerified: true,
                     displayName: `${firstName} ${lastName}`,

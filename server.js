@@ -1,5 +1,3 @@
-// server.js
-
 const express = require('express');
 const cors = require('cors');
 const { MongoClient, ObjectId } = require('mongodb'); 
@@ -9,7 +7,7 @@ const firebase = require('firebase/app');
 // 🎯 SECURE IMPORT: Imports the initialized Admin SDK using environment variables
 const admin = require('./firebaseAdmin'); 
 
-// ✅ UPDATED IMPORT: Now imports the custom code generator and sender
+// ✅ UPDATED IMPORT: Uses the Resend-compatible functions from emailService.js
 const { 
     generateVerificationCode, 
     sendCustomVerificationCodeEmail, 
@@ -30,8 +28,6 @@ app.use(express.json());
 app.use(express.static('public'));
 
 // 🎯 MONGO DB CONFIG (Using Environment Variable is HIGHLY Recommended for URI)
-// NOTE: For Render, you should set a MONGO_URI environment variable.
-// ⚠️ DANGER: Removed hardcoded URI. ONLY use the environment variable on Render.
 const uri = process.env.MONGO_URI; 
 const DB_NAME = "scholarship_db"; 
 const STUDENTS_COLLECTION = "students"; 
@@ -44,9 +40,8 @@ let applicationsCollection;
 
 
 // 🔑 FIREBASE CLIENT CONFIGURATION (PUBLIC & SAFE TO EXPOSE)
-// MODIFIED: Using standard env names (e.g., FIREBASE_API_KEY instead of FIREBASE_PUBLIC_API_KEY)
 const FIREBASE_CLIENT_CONFIG = {
-    apiKey: process.env.FIREBASE_API_KEY,      // ⬅️ CRITICAL CHANGE: Using standard name
+    apiKey: process.env.FIREBASE_API_KEY,      
     authDomain: process.env.FIREBASE_AUTH_DOMAIN,
     projectId: process.env.FIREBASE_PROJECT_ID,
     storageBucket: process.env.FIREBASE_STORAGE_BUCKET, 
@@ -55,6 +50,7 @@ const FIREBASE_CLIENT_CONFIG = {
     measurementId: process.env.FIREBASE_MEASUREMENT_ID 
 };
 
+// --- Helper Function: syncUserToFirebase (Unchanged, remains critical for data integrity) ---
 async function syncUserToFirebase(user) {
     const { studentNo, email, firstName, middleInitial, lastName, role, course, yearLevel } = user;
     let firebaseUid = studentNo; 
@@ -63,13 +59,10 @@ async function syncUserToFirebase(user) {
     try {
         await admin.auth().getUser(studentNo);
         
-        // NOTE: We set emailVerified to true here IF the user is verified in MongoDB, 
-        // ensuring the Firebase record reflects the verified state.
         const isVerified = user.isVerified || false; 
 
         await admin.auth().updateUser(studentNo, {
             email: email,
-            // ⚠️ CRITICAL: Only set to true if MongoDB says it's verified.
             emailVerified: isVerified, 
             displayName: `${firstName} ${lastName}`,
         });
@@ -78,18 +71,18 @@ async function syncUserToFirebase(user) {
     } catch (error) {
         if (error.code === 'auth/user-not-found') {
             try {
-                // If user doesn't exist, create them (emailVerified: false is handled by /api/register)
+                // If user doesn't exist, create them
                 const newUser = await admin.auth().createUser({
                     uid: studentNo, // Enforce studentNo as the UID
                     email: email,
-                    emailVerified: false, // Start unverified, code-based verification will update this later.
+                    emailVerified: false, 
                     displayName: `${firstName} ${lastName}`,
                 });
                 firebaseUid = newUser.uid;
                 console.log(`✅ Created new Firebase Auth user: ${newUser.uid}`);
             } catch (createError) {
                 if (createError.code === 'auth/email-already-exists') {
-                    console.error(`❌ CRITICAL CONFLICT: Email ${email} is linked to a different Firebase UID. Cannot proceed with studentNo: ${studentNo}. User must be manually merged or deleted.`);
+                    console.error(`❌ CRITICAL CONFLICT: Email ${email} is linked to a different Firebase UID. User must be manually merged or deleted.`);
                     throw new Error("Email is already in use by another Firebase account. Contact support for account reset.");
                 } else {
                     console.error("❌ Firebase Auth Sync Failed on create:", createError);
@@ -139,7 +132,6 @@ async function syncUserToFirebase(user) {
 const checkDbConnection = (req, res, next) => {
     if (!studentsCollection || !applicationsCollection) { 
         console.error("❌ Database collection is not ready. Server may still be connecting.");
-        // MODIFIED: Check for missing URI separately
         if (!process.env.MONGO_URI) {
             return res.status(500).json({ success: false, message: "Server is misconfigured (MONGO_URI missing)." });
         }
@@ -154,11 +146,7 @@ app.use('/api', checkDbConnection);
 
 // 🛡️ ADMIN MIDDLEWARE (PLACEHOLDER - SHOULD VERIFY FIREBASE ID TOKEN ROLE) 🛡️
 const verifyAdmin = async (req, res, next) => {
-    // ⚠️ TODO: Implement real token verification and role check here using Firebase Admin SDK:
-    // const idToken = req.headers.authorization.split('Bearer ')[1];
-    // const decodedToken = await admin.auth().verifyIdToken(idToken);
-    // if (decodedToken.role !== 'admin') { return res.status(403).json(...) }
-    
+    // ⚠️ TODO: Implement real token verification and role check here using Firebase Admin SDK
     console.log("[Middleware Placeholder] Admin authentication assumed successful.");
     return next();
 };
@@ -168,8 +156,6 @@ const verifyAdmin = async (req, res, next) => {
 
 // 🚀 CORS and Firebase Config Route (Updated for clarity) 🚀
 
-// ⚠️ IMPORTANT: CORS headers below assume your frontend is hosted on 'https://loaiskoportal.web.app'.
-// If your frontend is hosted elsewhere (e.g., another Render service), UPDATE this URL!
 const FRONTEND_ORIGIN = 'https://loaiskoportal.web.app'; 
 
 app.use(cors({ 
@@ -182,7 +168,6 @@ app.use(cors({
  * 🔑 NEW SECURE ROUTE: GET /api/firebase-config
  */
 app.get('/api/firebase-config', (req, res) => {
-    // CORS headers are now set globally by app.use(cors) above.
     
     if (!FIREBASE_CLIENT_CONFIG.apiKey) {
         console.error("❌ Firebase client config is missing API key. Check environment variables.");
@@ -192,14 +177,6 @@ app.get('/api/firebase-config', (req, res) => {
 });
 // 🚀 CRITICAL CORS FIX END 🚀
 
-
-// ⚠️ OLD ENDPOINT REMOVED/COMMENTED OUT:
-/*
-// 🆕 OLD VERIFICATION ENDPOINT (Link-based - REMOVED)
-app.post('/api/verify-email', async (req, res) => {
-    // ... logic for link-based verification (removed)
-});
-*/
 
 // 🆕 NEW VERIFICATION ENDPOINT: POST /api/submit-code
 app.post('/api/submit-code', async (req, res) => {
@@ -225,9 +202,9 @@ app.post('/api/submit-code', async (req, res) => {
             return res.status(400).json({ success: false, message: "Invalid verification code." });
         }
         if (user.codeExpiresAt && user.codeExpiresAt < now) {
-             // We can optionally delete the expired code fields here
-             await studentsCollection.updateOne({ email }, { $unset: { verificationCode: "", codeExpiresAt: "" } });
-             return res.status(400).json({ success: false, message: "Verification code has expired. Please request a new one." });
+            // We can optionally delete the expired code fields here
+            await studentsCollection.updateOne({ email }, { $unset: { verificationCode: "", codeExpiresAt: "" } });
+            return res.status(400).json({ success: false, message: "Verification code has expired. Please request a new one." });
         }
         
         // 2. Mark as verified in MongoDB and clear code fields
@@ -242,11 +219,11 @@ app.post('/api/submit-code', async (req, res) => {
         
         // 3. Update Firebase Auth to reflect verified status
         try {
-             await admin.auth().updateUser(user.studentNo, { emailVerified: true });
-             console.log(`✅ Firebase Auth user ${user.studentNo} marked as verified.`);
+            await admin.auth().updateUser(user.studentNo, { emailVerified: true });
+            console.log(`✅ Firebase Auth user ${user.studentNo} marked as verified.`);
         } catch (authUpdateError) {
-             console.error("❌ Firebase Auth update failed during code verification:", authUpdateError);
-             // Non-critical failure: log it, but verification continues as MongoDB is primary source
+            console.error("❌ Firebase Auth update failed during code verification:", authUpdateError);
+            // Non-critical failure: log it, but verification continues as MongoDB is primary source
         }
 
         console.log(`✅ Account verified (Code-based) and MongoDB/Firebase updated for: ${email}`);
@@ -265,7 +242,7 @@ app.post('/api/submit-code', async (req, res) => {
 
 
 /**
- * POST /api/register (MODIFIED)
+ * POST /api/register (Uses sendCustomVerificationCodeEmail)
  */
 app.post('/api/register', async (req, res) => {
     const { firstName, middleInitial, lastName, studentNo, course, yearLevel, email, password } = req.body;
@@ -292,7 +269,7 @@ app.post('/api/register', async (req, res) => {
         const codeExpiresAt = new Date(Date.now() + 15 * 60 * 1000); 
         // --- END NEW CODE ---
         
-        // 1. Create user in Firebase Auth (emailVerified: false is MANDATORY here)
+        // 1. Create user in Firebase Auth
         const firebaseUser = await admin.auth().createUser({
             uid: studentNo, 
             email: email,
@@ -309,15 +286,14 @@ app.post('/api/register', async (req, res) => {
             password: hashedPassword,
             role: "student",
             isVerified: false, 
-            verificationCode: verificationCode, // <-- NEW FIELD
-            codeExpiresAt: codeExpiresAt,      // <-- NEW FIELD
+            verificationCode: verificationCode, 
+            codeExpiresAt: codeExpiresAt,      
             createdAt: new Date(),
         };
 
         await studentsCollection.insertOne(newUserDocument);
         
-        // 3. Send the custom code email
-        // We no longer rely on FRONTEND_URL being set for email sending.
+        // 3. Send the custom code email using the Resend implementation
         const emailSent = await sendCustomVerificationCodeEmail(email, verificationCode); 
         
         if (!emailSent) {
@@ -358,7 +334,7 @@ app.post('/api/register', async (req, res) => {
 
 
 /**
- * POST /api/login-and-sync (Logic unchanged, but now requires code verification)
+ * POST /api/login-and-sync (Logic unchanged)
  */
 app.post('/api/login-and-sync', async (req, res) => {
     const { email, password } = req.body;
@@ -380,7 +356,6 @@ app.post('/api/login-and-sync', async (req, res) => {
                 success: false, 
                 message: "Account is not verified. Please enter the verification code sent to your email.",
                 needsVerification: true,
-                // Optionally send the user's studentNo or email here for the front end to use in /submit-code
             });
         }
 
@@ -431,7 +406,7 @@ app.post('/api/login-and-sync', async (req, res) => {
 
 
 /**
- * POST /api/resend-verification (MODIFIED)
+ * POST /api/resend-verification (Uses sendCustomVerificationCodeEmail)
  */
 app.post('/api/resend-verification', async (req, res) => {
     const { email } = req.body;
@@ -459,7 +434,7 @@ app.post('/api/resend-verification', async (req, res) => {
             { $set: { verificationCode: newCode, codeExpiresAt: newExpiresAt } }
         );
 
-        // 2. Send the new custom code
+        // 2. Send the new custom code using the Resend implementation
         const emailSent = await sendCustomVerificationCodeEmail(email, newCode);
 
         if (!emailSent) {
@@ -477,7 +452,7 @@ app.post('/api/resend-verification', async (req, res) => {
 
 
 /**
- * POST /api/send-status-email (Logic unchanged)
+ * POST /api/send-status-email (Uses sendApplicationStatusEmail)
  */
 app.post('/api/send-status-email', verifyAdmin, async (req, res) => {
     const { docId, status, email, name, scholarshipType } = req.body; 
@@ -490,6 +465,7 @@ app.post('/api/send-status-email', verifyAdmin, async (req, res) => {
     }
 
     try {
+        // Uses the updated Resend-compatible function
         const emailSent = await sendApplicationStatusEmail(email, name, scholarshipType, status);
 
         if (!emailSent) {
@@ -597,7 +573,11 @@ async function initializeServer() {
         studentsCollection = db.collection(STUDENTS_COLLECTION);
         applicationsCollection = db.collection(APPLICATIONS_COLLECTION); 
         
-        console.log("✅ MongoDB successfully connected and collections ready.");
+        // Ensure unique indexes exist for critical fields
+        await studentsCollection.createIndex({ studentNo: 1 }, { unique: true });
+        await studentsCollection.createIndex({ email: 1 }, { unique: true });
+        
+        console.log("✅ MongoDB successfully connected, collections ready, and indexes applied.");
 
         app.listen(PORT, () => {
             console.log(`🚀 Server running on http://localhost:${PORT}`);

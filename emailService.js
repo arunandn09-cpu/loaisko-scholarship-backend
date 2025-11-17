@@ -1,24 +1,28 @@
 const admin = require('./firebaseAdmin'); 
-const { Resend } = require('resend'); // Import the Resend SDK
+const { MailerSend, EmailParams, Sender, Recipient } = require('mailersend');
 
-// --- 🎯 RESEND SETUP ---
-// Initialize Resend client using the environment variable
-// The environment variable MUST be named RESEND_API_KEY in Render.
-const RESEND_API_KEY = process.env.RESEND_API_KEY;
-const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+// --- 🎯 MAILERSEND SETUP ---
+// Initialize MailerSend client using the environment variable
+// The environment variable MUST be named MAILERSEND_API_KEY.
+const MAILERSEND_API_KEY = process.env.MAILERSEND_API_KEY;
 
-// SENDER_EMAIL must be set in Render to the verified email (loaiskoportal@alabangscholarship.info)
+// ⚠️ IMPORTANT: You need to install the MailerSend SDK: npm install mailersend
+const mailersend = MAILERSEND_API_KEY ? new MailerSend({
+    apiKey: MAILERSEND_API_KEY,
+}) : null;
+
+// SENDER_EMAIL must be set to a verified email (e.g., loaiskoportal@alabangscholarship.info)
 const SENDER_EMAIL = process.env.SENDER_EMAIL; 
 
 // Validation Check
-if (!RESEND_API_KEY) {
-    console.error("❌ RESEND_API_KEY is missing from environment variables. Email sending will fail.");
+if (!MAILERSEND_API_KEY) {
+    console.error("❌ MAILERSEND_API_KEY is missing from environment variables. Email sending will fail.");
 }
 if (!SENDER_EMAIL) {
     console.error("❌ SENDER_EMAIL is missing from environment variables. Email sending will fail.");
 }
-if (!resend) {
-    console.warn("⚠️ Resend client is not initialized due to missing API key.");
+if (!mailersend) {
+    console.warn("⚠️ MailerSend client is not initialized due to missing API key.");
 }
 
 
@@ -33,52 +37,58 @@ function generateVerificationCode() {
 
 
 /**
- * Sends a custom 6-digit verification code via Resend.
+ * Sends a custom 6-digit verification code via MailerSend.
  * @param {string} recipientEmail - The email address to send the code to.
  * @param {string} code - The 6-digit verification code to include in the email.
  * @returns {Promise<boolean>} - True if the email was successfully sent.
  */
 async function sendCustomVerificationCodeEmail(recipientEmail, code) {
-    if (!resend || !SENDER_EMAIL) {
-        console.error("Resend service not ready. Cannot send verification email.");
+    if (!mailersend || !SENDER_EMAIL) {
+        console.error("MailerSend service not ready. Cannot send verification email.");
         return false;
     }
+    
+    // 1. Define Sender and Recipient
+    const sender = new Sender(SENDER_EMAIL, "LOAISKOPORTAL Scholarship");
+    const recipients = [new Recipient(recipientEmail)];
+
+    // 2. Define HTML content
+    const htmlContent = `
+        <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; padding: 20px; border: 1px solid #e6c200; border-radius: 8px;">
+            <h1 style="color: #003366;">Account Verification Code</h1>
+            <p>Thank you for registering. Please use the code below to verify your account in the portal:</p>
+            <div style="background-color: #f0f4f8; padding: 20px; text-align: center; border-radius: 8px; margin: 25px 0;">
+                <h2 style="color: #e6c200; margin: 0; font-size: 32px; letter-spacing: 5px;">${code}</h2>
+            </div>
+            <p>This code is time-sensitive. Please enter it on the verification screen to proceed.</p>
+            <p style="font-size: 0.8em; color: #777;">If you did not initiate this registration, please ignore this email.</p>
+        </div>
+    `;
+
+    // 3. Build Email Parameters
+    const emailParams = new EmailParams()
+        .setFrom(sender)
+        .setTo(recipients)
+        .setSubject("Verification Code for Your Account")
+        .setHtml(htmlContent)
+        .setText(`Your verification code is: ${code}. This code is time-sensitive.`);
 
     try {
-        const { data, error } = await resend.emails.send({
-            // Use the verified SENDER_EMAIL with a friendly display name
-            from: `LOAISKOPORTAL Scholarship <${SENDER_EMAIL}>`, 
-            to: [recipientEmail],
-            subject: "Verification Code for Your Account",
-            html: `
-                <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333; padding: 20px; border: 1px solid #e6c200; border-radius: 8px;">
-                    <h1 style="color: #003366;">Account Verification Code</h1>
-                    <p>Thank you for registering. Please use the code below to verify your account in the portal:</p>
-                    <div style="background-color: #f0f4f8; padding: 20px; text-align: center; border-radius: 8px; margin: 25px 0;">
-                        <h2 style="color: #e6c200; margin: 0; font-size: 32px; letter-spacing: 5px;">${code}</h2>
-                    </div>
-                    <p>This code is time-sensitive. Please enter it on the verification screen to proceed.</p>
-                    <p style="font-size: 0.8em; color: #777;">If you did not initiate this registration, please ignore this email.</p>
-                </div>
-            `,
-        });
+        // 4. Send the email
+        await mailersend.email.send(emailParams);
 
-        if (error) {
-            console.error("❌ RESEND API Error:", error);
-            return false;
-        }
-
-        console.log(`✅ Custom verification code sent via Resend to ${recipientEmail}. Resend ID: ${data.id}`);
+        console.log(`✅ Custom verification code sent via MailerSend to ${recipientEmail}.`);
         return true;
     } catch (error) {
-        console.error("❌ Resend SDK Network/Sending Error:", error);
+        // Log the error response data if available for better debugging
+        console.error("❌ MailerSend SDK Network/Sending Error:", error.response?.data || error);
         return false;
     }
 }
 
 
 /**
- * Sends an email confirming the scholarship application status using Resend.
+ * Sends an email confirming the scholarship application status using MailerSend.
  * @param {string} recipientEmail - The student's email.
  * @param {string} studentName - The student's name.
  * @param {string} scholarshipType - The type of scholarship applied for.
@@ -86,15 +96,15 @@ async function sendCustomVerificationCodeEmail(recipientEmail, code) {
  * @returns {Promise<boolean>} - True if the email was successfully sent.
  */
 async function sendApplicationStatusEmail(recipientEmail, studentName, scholarshipType, status) {
-    if (!resend || !SENDER_EMAIL) {
-        console.error("Resend service not ready. Cannot send application status email.");
+    if (!mailersend || !SENDER_EMAIL) {
+        console.error("MailerSend service not ready. Cannot send application status email.");
         return false;
     }
 
     const lowerStatus = status.toLowerCase();
     let subject, primaryColor, headerText, bodyContent;
 
-    // --- Status Logic (Kept the same) ---
+    // --- Status Logic ---
     switch (lowerStatus) {
         case 'approved':
             subject = `🎉 Scholarship Application APPROVED!`;
@@ -135,26 +145,29 @@ async function sendApplicationStatusEmail(recipientEmail, studentName, scholarsh
             <p style="font-size: 0.8em; color: #777;">This is an automated notification. Please do not reply to this email.</p>
         </div>
     `;
+    
+    // 1. Define Sender and Recipient
+    const sender = new Sender(SENDER_EMAIL, "LOAISKOPORTAL Scholarship");
+    const recipients = [new Recipient(recipientEmail)];
+
+    // 2. Build Email Parameters
+    const emailParams = new EmailParams()
+        .setFrom(sender)
+        .setTo(recipients)
+        .setSubject(subject)
+        .setHtml(htmlTemplate)
+        .setText(`Dear ${studentName}, your application status for the ${scholarshipType} is now ${status}.`); // Plain text fallback
 
     try {
-        const { data, error } = await resend.emails.send({
-            from: `LOAISKOPORTAL Scholarship <${SENDER_EMAIL}>`,
-            to: [recipientEmail],
-            subject: subject,
-            html: htmlTemplate,
-        });
-
-        if (error) {
-            const errorBody = error.message;
-            console.error(`❌ STATUS EMAIL SEND FAILURE via Resend to ${recipientEmail}:`, errorBody);
-            return false;
-        }
+        // 3. Send the email
+        await mailersend.email.send(emailParams);
         
-        console.log(`✉️ Status email (${status}) sent via Resend to ${recipientEmail}. Resend ID: ${data.id}`);
+        console.log(`✉️ Status email (${status}) sent via MailerSend to ${recipientEmail}.`);
         return true;
         
     } catch (error) {
-        console.error(`❌ STATUS EMAIL NETWORK FAILURE to ${recipientEmail}:`, error);
+        // Log the error response data if available for better debugging
+        console.error(`❌ STATUS EMAIL SEND FAILURE via MailerSend to ${recipientEmail}:`, error.response?.data || error);
         return false;
     }
 }

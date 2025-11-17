@@ -9,8 +9,12 @@ const firebase = require('firebase/app');
 // 🎯 SECURE IMPORT: Imports the initialized Admin SDK using environment variables
 const admin = require('./firebaseAdmin'); 
 
-// ✅ UPDATED IMPORT: Uses the MailerSend-powered verification function
-const { sendFirebaseVerificationEmail, sendApplicationStatusEmail } = require('./emailService'); 
+// ✅ UPDATED IMPORT: Now imports the custom code generator and sender
+const { 
+    generateVerificationCode, 
+    sendCustomVerificationCodeEmail, 
+    sendApplicationStatusEmail 
+} = require('./emailService'); 
 
 // --- 1. CORE EXPRESS INITIALIZATION ---
 const app = express();
@@ -42,7 +46,7 @@ let applicationsCollection;
 // 🔑 FIREBASE CLIENT CONFIGURATION (PUBLIC & SAFE TO EXPOSE)
 // MODIFIED: Using standard env names (e.g., FIREBASE_API_KEY instead of FIREBASE_PUBLIC_API_KEY)
 const FIREBASE_CLIENT_CONFIG = {
-    apiKey: process.env.FIREBASE_API_KEY,           // ⬅️ CRITICAL CHANGE: Using standard name
+    apiKey: process.env.FIREBASE_API_KEY,      // ⬅️ CRITICAL CHANGE: Using standard name
     authDomain: process.env.FIREBASE_AUTH_DOMAIN,
     projectId: process.env.FIREBASE_PROJECT_ID,
     storageBucket: process.env.FIREBASE_STORAGE_BUCKET, 
@@ -59,20 +63,26 @@ async function syncUserToFirebase(user) {
     try {
         await admin.auth().getUser(studentNo);
         
+        // NOTE: We set emailVerified to true here IF the user is verified in MongoDB, 
+        // ensuring the Firebase record reflects the verified state.
+        const isVerified = user.isVerified || false; 
+
         await admin.auth().updateUser(studentNo, {
             email: email,
-            emailVerified: true,
+            // ⚠️ CRITICAL: Only set to true if MongoDB says it's verified.
+            emailVerified: isVerified, 
             displayName: `${firstName} ${lastName}`,
         });
-        console.log(`🔄 Updated existing Firebase Auth user: ${studentNo}`);
+        console.log(`🔄 Updated existing Firebase Auth user: ${studentNo} (Verified: ${isVerified})`);
 
     } catch (error) {
         if (error.code === 'auth/user-not-found') {
             try {
+                // If user doesn't exist, create them (emailVerified: false is handled by /api/register)
                 const newUser = await admin.auth().createUser({
                     uid: studentNo, // Enforce studentNo as the UID
                     email: email,
-                    emailVerified: true,
+                    emailVerified: false, // Start unverified, code-based verification will update this later.
                     displayName: `${firstName} ${lastName}`,
                 });
                 firebaseUid = newUser.uid;
@@ -107,7 +117,8 @@ async function syncUserToFirebase(user) {
             course,
             yearLevel,
             role,
-            verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+            // If the user is verified, update the Firestore timestamp.
+            verifiedAt: user.isVerified ? admin.firestore.FieldValue.serverTimestamp() : null,
         }, { merge: true }); 
         
         console.log(`✅ Synced student profile to Firestore 'students' collection for UID ${firebaseUid}.`);
@@ -182,59 +193,79 @@ app.get('/api/firebase-config', (req, res) => {
 // 🚀 CRITICAL CORS FIX END 🚀
 
 
-// 🆕 NEW VERIFICATION ENDPOINT (Logic unchanged)
+// ⚠️ OLD ENDPOINT REMOVED/COMMENTED OUT:
+/*
+// 🆕 OLD VERIFICATION ENDPOINT (Link-based - REMOVED)
 app.post('/api/verify-email', async (req, res) => {
-    const { oobCode } = req.body; 
+    // ... logic for link-based verification (removed)
+});
+*/
 
-    if (!oobCode) {
-        return res.status(400).json({ success: false, message: "Missing action code." });
+// 🆕 NEW VERIFICATION ENDPOINT: POST /api/submit-code
+app.post('/api/submit-code', async (req, res) => {
+    const { email, code } = req.body; 
+
+    if (!email || !code) {
+        return res.status(400).json({ success: false, message: "Email and verification code are required." });
     }
 
-    let emailToVerify;
-
     try {
-        const result = await admin.auth().checkActionCode(oobCode);
-        emailToVerify = result.data.email;
-        
-        await admin.auth().applyActionCode(oobCode);
+        const user = await studentsCollection.findOne({ email });
 
+        if (!user) {
+            return res.status(404).json({ success: false, message: "User not found." });
+        }
+        if (user.isVerified) {
+            return res.json({ success: true, message: "Account is already verified. Please log in." });
+        }
+
+        // 1. Check if the provided code matches and is not expired
+        const now = new Date();
+        if (user.verificationCode !== code) {
+            return res.status(400).json({ success: false, message: "Invalid verification code." });
+        }
+        if (user.codeExpiresAt && user.codeExpiresAt < now) {
+             // We can optionally delete the expired code fields here
+             await studentsCollection.updateOne({ email }, { $unset: { verificationCode: "", codeExpiresAt: "" } });
+             return res.status(400).json({ success: false, message: "Verification code has expired. Please request a new one." });
+        }
+        
+        // 2. Mark as verified in MongoDB and clear code fields
         const updateResult = await studentsCollection.findOneAndUpdate(
-            { email: emailToVerify },
+            { email: email },
             { 
                 $set: { isVerified: true, verifiedAt: new Date() },
+                $unset: { verificationCode: "", codeExpiresAt: "" } 
             },
             { returnDocument: 'after' } 
         );
         
-        const user = updateResult.value;
-
-        if (!user) {
-            console.error(`❌ Verification success in Firebase, but MongoDB user not found: ${emailToVerify}`);
-            return res.status(404).json({ success: false, message: "User not found in database after verification." });
+        // 3. Update Firebase Auth to reflect verified status
+        try {
+             await admin.auth().updateUser(user.studentNo, { emailVerified: true });
+             console.log(`✅ Firebase Auth user ${user.studentNo} marked as verified.`);
+        } catch (authUpdateError) {
+             console.error("❌ Firebase Auth update failed during code verification:", authUpdateError);
+             // Non-critical failure: log it, but verification continues as MongoDB is primary source
         }
-        
-        console.log(`✅ Account verified and MongoDB updated for: ${emailToVerify}`);
+
+        console.log(`✅ Account verified (Code-based) and MongoDB/Firebase updated for: ${email}`);
 
         res.json({ 
             success: true, 
             message: "Email successfully verified. You can now log in.",
-            userEmail: emailToVerify 
+            userEmail: email 
         });
 
     } catch (error) {
-        console.error("❌ Email Verification Failed:", error.message);
-        
-        if (error.code === 'auth/invalid-action-code') {
-            return res.status(400).json({ success: false, message: "The verification link is invalid or has expired." });
-        }
-        
+        console.error("❌ Code Verification Failed:", error.message);
         res.status(500).json({ success: false, message: `Server error during verification: ${error.message}` });
     }
 });
 
 
 /**
- * POST /api/register (Logic unchanged)
+ * POST /api/register (MODIFIED)
  */
 app.post('/api/register', async (req, res) => {
     const { firstName, middleInitial, lastName, studentNo, course, yearLevel, email, password } = req.body;
@@ -255,6 +286,13 @@ app.post('/api/register', async (req, res) => {
             return res.status(409).json({ success: false, message: 'This email is already registered. Please log in.' });
         }
         
+        // --- NEW CODE GENERATION & STORAGE ---
+        const verificationCode = generateVerificationCode(); 
+        // Code expires in 15 minutes (900,000 milliseconds)
+        const codeExpiresAt = new Date(Date.now() + 15 * 60 * 1000); 
+        // --- END NEW CODE ---
+        
+        // 1. Create user in Firebase Auth (emailVerified: false is MANDATORY here)
         const firebaseUser = await admin.auth().createUser({
             uid: studentNo, 
             email: email,
@@ -263,6 +301,7 @@ app.post('/api/register', async (req, res) => {
             emailVerified: false, 
         });
         
+        // 2. Hash password and save user in MongoDB
         const hashedPassword = await bcrypt.hash(password, saltRounds);
         
         const newUserDocument = {
@@ -270,33 +309,30 @@ app.post('/api/register', async (req, res) => {
             password: hashedPassword,
             role: "student",
             isVerified: false, 
+            verificationCode: verificationCode, // <-- NEW FIELD
+            codeExpiresAt: codeExpiresAt,      // <-- NEW FIELD
             createdAt: new Date(),
         };
 
         await studentsCollection.insertOne(newUserDocument);
         
-        const frontendRedirectUrl = process.env.FRONTEND_URL; 
-        
-        if (!frontendRedirectUrl) {
-             await admin.auth().deleteUser(firebaseUser.uid); 
-             await studentsCollection.deleteOne({ email }); 
-             return res.status(500).json({ success: false, message: "Server configuration error: FRONTEND_URL is missing. Registration failed." });
-        }
-
-        const emailSent = await sendFirebaseVerificationEmail(email); 
+        // 3. Send the custom code email
+        // We no longer rely on FRONTEND_URL being set for email sending.
+        const emailSent = await sendCustomVerificationCodeEmail(email, verificationCode); 
         
         if (!emailSent) {
             console.error(`❌ FAILED to send verification email for ${email}. Deleting user.`);
+            // Clean up: Delete Firebase user and MongoDB document if email fails to send
             await admin.auth().deleteUser(firebaseUser.uid); 
             await studentsCollection.deleteOne({ email }); 
-            return res.status(500).json({ success: false, message: "Registration failed: Could not send verification email. Please try again later." });
+            return res.status(500).json({ success: false, message: "Registration failed: Could not send verification code. Please try again later." });
         }
         
-        console.log(`✅ User registered (pending verification): ${email}`);
+        console.log(`✅ User registered (pending verification) and code sent: ${email}`);
         
         res.json({ 
             success: true, 
-            message: `Registration successful. A verification link has been sent to your email (${email}). Please check your inbox to verify your account and log in.` 
+            message: `Registration successful. A verification code has been sent to your email (${email}). Please enter the code to verify your account and log in.` 
         });
 
     } catch (error) {
@@ -305,9 +341,9 @@ app.post('/api/register', async (req, res) => {
         if (error.code === 11000) {
             let detail = 'A user with this email or student number already exists.';
             if (error.message.includes('studentNo')) {
-                  detail = 'The **Student Number** is already registered.';
+                detail = 'The **Student Number** is already registered.';
             } else if (error.message.includes('email')) {
-                  detail = 'The Email is already registered.';
+                detail = 'The Email is already registered.';
             }
             return res.status(409).json({ success: false, message: detail });
         }
@@ -322,7 +358,7 @@ app.post('/api/register', async (req, res) => {
 
 
 /**
- * POST /api/login-and-sync (Logic unchanged)
+ * POST /api/login-and-sync (Logic unchanged, but now requires code verification)
  */
 app.post('/api/login-and-sync', async (req, res) => {
     const { email, password } = req.body;
@@ -342,8 +378,9 @@ app.post('/api/login-and-sync', async (req, res) => {
             console.warn(`⚠️ Blocked login: User ${email} is not verified.`);
             return res.status(403).json({ 
                 success: false, 
-                message: "Account is not verified. Redirecting to verification page.",
-                needsVerification: true 
+                message: "Account is not verified. Please enter the verification code sent to your email.",
+                needsVerification: true,
+                // Optionally send the user's studentNo or email here for the front end to use in /submit-code
             });
         }
 
@@ -356,6 +393,7 @@ app.post('/api/login-and-sync', async (req, res) => {
         let firebaseUid;
 
         try {
+            // This sync call now correctly updates Firebase Auth's emailVerified status based on MongoDB.
             firebaseUid = await syncUserToFirebase(user); 
             
             const customToken = await admin.auth().createCustomToken(firebaseUid);
@@ -393,7 +431,7 @@ app.post('/api/login-and-sync', async (req, res) => {
 
 
 /**
- * POST /api/resend-verification (Logic unchanged)
+ * POST /api/resend-verification (MODIFIED)
  */
 app.post('/api/resend-verification', async (req, res) => {
     const { email } = req.body;
@@ -412,22 +450,27 @@ app.post('/api/resend-verification', async (req, res) => {
             return res.json({ success: true, message: "Account is already verified. Please log in." });
         }
         
-        const frontendRedirectUrl = process.env.FRONTEND_URL; 
-        if (!frontendRedirectUrl) {
-            return res.status(500).json({ success: false, message: "Server configuration error: FRONTEND_URL is missing." });
-        }
+        // 1. Generate new code and update MongoDB
+        const newCode = generateVerificationCode();
+        const newExpiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+        
+        await studentsCollection.updateOne(
+            { email },
+            { $set: { verificationCode: newCode, codeExpiresAt: newExpiresAt } }
+        );
 
-        const emailSent = await sendFirebaseVerificationEmail(email);
+        // 2. Send the new custom code
+        const emailSent = await sendCustomVerificationCodeEmail(email, newCode);
 
         if (!emailSent) {
-            return res.status(500).json({ success: false, message: "Failed to send new verification email. Check server logs." });
+            return res.status(500).json({ success: false, message: "Failed to send new verification code. Check server logs." });
         }
 
-        console.log(`✉️ Resent Firebase verification link to ${email}`);
-        res.json({ success: true, message: `A new verification link has been sent to ${email}.` });
+        console.log(`✉️ Resent custom verification code to ${email}`);
+        res.json({ success: true, message: `A new verification code has been sent to ${email}.` });
 
     } catch (error) {
-        console.error("❌ Resend Link Failed:", error);
+        console.error("❌ Resend Code Failed:", error);
         res.status(500).json({ success: false, message: "Server error during resend verification operation." });
     }
 });

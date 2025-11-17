@@ -1,83 +1,78 @@
 // emailService.js
 
-const admin = require('./firebaseAdmin'); // Import the initialized Admin SDK
+const admin = require('./firebaseAdmin'); // Keep the Admin SDK import for token generation
+const fetch = require('node-fetch'); // Use built-in node-fetch/axios for simpler API call
 
 // --- 🎯 MAILERSEND SETUP ---
-// Install: npm install mailersend
-const { MailerSend, EmailParams, Sender, Recipient } = require("mailersend");
+// We will use standard fetch for the code-based email to simplify, 
+// as the mailersend SDK seems to require a custom class setup which can be verbose.
 
 // Retrieve credentials from Render Environment Variables
 const MAILERSEND_API_KEY = process.env.MAILERSEND_API_KEY;
 const SENDER_EMAIL = process.env.SENDER_EMAIL; 
-const FRONTEND_URL = process.env.FRONTEND_URL; // For generating the redirect URL
+// FRONTEND_URL is no longer needed for code-based verification email, but kept for context/other uses
 
 // Validation Check
-if (!MAILERSEND_API_KEY || !SENDER_EMAIL || !FRONTEND_URL) {
-    console.error("❌ MAILERSEND/URL credentials (MAILERSEND_API_KEY, SENDER_EMAIL, FRONTEND_URL) are missing from environment variables. Email sending will fail.");
+if (!MAILERSEND_API_KEY || !SENDER_EMAIL) {
+    console.error("❌ MAILERSEND/SENDER_EMAIL credentials are missing from environment variables. Email sending will fail.");
 }
 
-const mailersend = new MailerSend({
-    apiKey: MAILERSEND_API_KEY,
-});
-// The Sender object defines the 'From' email address and name
-const sender = new Sender(SENDER_EMAIL, "LOAISKOPORTAL Scholarship");
+/**
+ * Generates a random 6-digit numeric verification code.
+ * @returns {string} - The 6-digit code.
+ */
+function generateVerificationCode() {
+    // Generate a number between 100000 and 999999 (inclusive)
+    return Math.floor(100000 + Math.random() * 900000).toString();
+}
 
-// --- Removed all Nodemailer/GMAIL_APP_PASSWORD setup and related warnings ---
 
 /**
- * Sends a verification email link using the Firebase Admin SDK to generate the secure link, 
- * but uses MailerSend to send the email.
- * * @param {string} recipientEmail - The email address to send the verification to.
- * @returns {Promise<boolean>} - True if the email was successfully sent via MailerSend.
+ * Sends a custom 6-digit verification code via MailerSend.
+ * This replaces the broken Firebase link generation.
+ * @param {string} recipientEmail - The email address to send the code to.
+ * @param {string} code - The 6-digit verification code to include in the email.
+ * @returns {Promise<boolean>} - True if the email was successfully sent.
  */
-async function sendFirebaseVerificationEmail(recipientEmail) {
-    // The redirect URL is constructed using the base FRONTEND_URL environment variable
-    const frontendRedirectUrl = `${FRONTEND_URL}/verify-email`; 
-    
-    const actionCodeSettings = {
-        // This is the URL your FRONTEND will handle after the Firebase server marks the user as verified.
-        url: frontendRedirectUrl, 
-        handleCodeInApp: false, // Ensures verification happens in a browser tab, not within the app
+async function sendCustomVerificationCodeEmail(recipientEmail, code) {
+    const message = {
+        from: { email: SENDER_EMAIL, name: "LOAISKOPORTAL Scholarship" },
+        to: [{ email: recipientEmail }],
+        subject: "Verification Code for Your Account",
+        html: `
+            <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+                <h1 style="color: #003366;">Account Verification Code</h1>
+                <p>Thank you for registering. Please use the code below to verify your account in the portal:</p>
+                <div style="background-color: #f0f4f8; padding: 20px; text-align: center; border-radius: 8px; margin: 25px 0;">
+                    <h2 style="color: #e6c200; margin: 0; font-size: 32px; letter-spacing: 5px;">${code}</h2>
+                </div>
+                <p>This code is time-sensitive. Please enter it on the verification screen to proceed.</p>
+                <p style="font-size: 0.8em; color: #777;">If you did not initiate this registration, please ignore this email.</p>
+            </div>
+        `,
     };
 
     try {
-        // 1. Generate the unique, time-sensitive action link using Firebase Admin SDK
-        const link = await admin.auth().generateEmailVerificationLink(
-            recipientEmail, 
-            actionCodeSettings
-        );
+        const response = await fetch('https://api.mailersend.com/v1/email', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${MAILERSEND_API_KEY}`,
+            },
+            body: JSON.stringify(message),
+        });
 
-        // 2. Prepare the email content for MailerSend
-        const recipient = new Recipient(recipientEmail);
-        
-        const htmlContent = `
-            <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
-                <h1>Account Verification Required</h1>
-                <p>Thank you for registering for the LOAISKOPORTAL. Please verify your email address to complete your registration and log in.</p>
-                <p style="margin-top: 25px;">
-                    <a href="${link}" style="color: #ffffff; background-color: #1a73e8; padding: 10px 20px; border-radius: 5px; text-decoration: none; font-weight: bold;">
-                        Click Here to Verify Your Email Address
-                    </a>
-                </p>
-                <p style="font-size: 0.8em; color: #777; margin-top: 20px;">If the button doesn't work, copy and paste the following link into your browser: <br/><a href="${link}">${link}</a></p>
-                <p style="font-size: 0.8em; color: #777;">If you did not initiate this registration, please ignore this email.</p>
-            </div>
-        `;
+        const result = await response.json();
 
-        const emailParams = new EmailParams()
-            .setFrom(sender)
-            .setTo([recipient])
-            .setSubject('Verify Your LOAISKOPORTAL Account')
-            .setHtml(htmlContent);
-
-        // 3. Send the email using MailerSend SDK
-        await mailersend.email.send(emailParams);
-        
-        console.log(`✉️ Firebase verification link successfully sent via MailerSend to ${recipientEmail}`);
-        return true;
-
+        if (response.ok) {
+            console.log(`✅ Custom verification code sent via MailerSend to ${recipientEmail}`);
+            return true;
+        } else {
+            console.error("❌ MAILERSEND API Error (Status: %s):", response.status, result);
+            return false;
+        }
     } catch (error) {
-        console.error(`❌ FIREBASE LINK GENERATION/MAILERSEND FAILURE to ${recipientEmail}:`, error.message, error.response?.data);
+        console.error("❌ MailerSend Network Error:", error);
         return false;
     }
 }
@@ -85,7 +80,7 @@ async function sendFirebaseVerificationEmail(recipientEmail) {
 
 /**
  * Sends an email confirming the scholarship application status using MailerSend.
- * NOTE: The server passes the exact status string.
+ * This function remains UNCHANGED.
  */
 async function sendApplicationStatusEmail(recipientEmail, studentName, scholarshipType, status) {
     const lowerStatus = status.toLowerCase();
@@ -134,27 +129,38 @@ async function sendApplicationStatusEmail(recipientEmail, studentName, scholarsh
     `;
 
     try {
-        const recipient = new Recipient(recipientEmail);
-        
-        const emailParams = new EmailParams()
-            .setFrom(sender)
-            .setTo([recipient])
-            .setSubject(subject)
-            .setHtml(htmlTemplate);
+        const message = {
+            from: { email: SENDER_EMAIL, name: "LOAISKOPORTAL Scholarship" },
+            to: [{ email: recipientEmail }],
+            subject: subject,
+            html: htmlTemplate,
+        };
 
-        // Send the email using MailerSend SDK
-        await mailersend.email.send(emailParams);
-        
-        console.log(`✉️ Status email (${status}) sent via MailerSend to ${recipientEmail}`);
-        return true;
-        
+        const response = await fetch('https://api.mailersend.com/v1/email', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${MAILERSEND_API_KEY}`,
+            },
+            body: JSON.stringify(message),
+        });
+
+        if (response.ok) {
+            console.log(`✉️ Status email (${status}) sent via MailerSend to ${recipientEmail}`);
+            return true;
+        } else {
+            const errorBody = await response.json();
+            console.error(`❌ STATUS EMAIL SEND FAILURE via MailerSend to ${recipientEmail}:`, response.status, errorBody);
+            return false;
+        }
     } catch (error) {
-        console.error(`❌ STATUS EMAIL SEND FAILURE via MailerSend to ${recipientEmail}:`, error.message, error.response?.data);
+        console.error(`❌ STATUS EMAIL NETWORK FAILURE to ${recipientEmail}:`, error);
         return false;
     }
 }
 
 module.exports = {
-    sendFirebaseVerificationEmail,
+    generateVerificationCode, // <-- NEW EXPORT
+    sendCustomVerificationCodeEmail, // <-- NEW EXPORT
     sendApplicationStatusEmail 
 };

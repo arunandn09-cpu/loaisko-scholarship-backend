@@ -110,22 +110,28 @@ const verifyAdmin = async (req, res, next) => {
 };
 
 // --- CORS FIX ---
+// This list MUST contain the EXACT origin (URL) where your admin portal is hosted.
+// Based on the logs, if the existing list doesn't work, you must find and add 
+// the actual origin from your browser's network tab.
 const allowedOrigins = [
     'https://loaiskoportal.web.app',
     'https://loaiskoportal.firebaseapp.com',
     'http://localhost:3000', 
     'http://localhost:5000'
+    // If you found a different origin in your network tab, add it here (e.g., 'https://your-custom-admin-url.com')
 ];
 
 app.use(cors({
     origin: (origin, callback) => {
+        // Allow requests from allowed origins or requests with no origin (like server-to-server or curl)
         if (allowedOrigins.includes(origin) || !origin) {
             callback(null, true);
         } else {
-            callback(new Error('Not allowed by CORS'), false);
+            // This is the line that caused the error in your Render logs
+            callback(new Error('Not allowed by CORS'), false); 
         }
     },
-    methods: ['GET', 'POST', 'OPTIONS', 'DELETE'],
+    methods: ['GET', 'POST', 'OPTIONS', 'DELETE'], // Ensure DELETE is allowed
     credentials: true
 }));
 // --- END CORS FIX ---
@@ -298,12 +304,23 @@ app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
         const mongoResult = await studentsCollection.deleteOne({ email });
         mongoDeleted = mongoResult.deletedCount > 0;
 
-        try { await admin.auth().deleteUser(studentNo); authDeleted = true; } catch (e) { console.warn("Firebase Auth deletion warning:", e.message); }
+        // Deleting from Firebase Auth (using studentNo as the UID)
+        try { await admin.auth().deleteUser(studentNo); authDeleted = true; } 
+        catch (e) { 
+            console.warn("Firebase Auth deletion warning:", e.message);
+            // Log the error but don't stop the process if the user was already deleted
+        }
+
+        // Deleting from Firestore (using studentNo as the Document ID)
         try {
             const firestoreDb = admin.firestore();
             await firestoreDb.collection('students').doc(studentNo).delete();
             await firestoreDb.collection('student_profiles').doc(studentNo).delete();
-        } catch (e) { console.warn("Firestore deletion warning:", e.message); }
+        } 
+        catch (e) { 
+            console.warn("Firestore deletion warning:", e.message); 
+            // Log the error but don't stop the process
+        }
 
         if (!mongoDeleted && !authDeleted) return res.status(404).json({ success: false, message: "No record found." });
 

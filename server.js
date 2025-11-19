@@ -63,7 +63,7 @@ async function syncUserToFirebase(user) {
             const newUser = await admin.auth().createUser({
                 uid: studentNo,
                 email,
-                emailVerified: false,
+                password,
                 displayName: `${firstName} ${lastName}`
             });
             firebaseUid = newUser.uid;
@@ -110,15 +110,13 @@ const verifyAdmin = async (req, res, next) => {
 };
 
 // --- CORS FIX ---
-// This list MUST contain the EXACT origin (URL) where your admin portal is hosted.
-// Based on the logs, if the existing list doesn't work, you must find and add 
-// the actual origin from your browser's network tab.
 const allowedOrigins = [
     'https://loaiskoportal.web.app',
     'https://loaiskoportal.firebaseapp.com',
     'http://localhost:3000', 
-    'http://localhost:5000'
-    // If you found a different origin in your network tab, add it here (e.g., 'https://your-custom-admin-url.com')
+    'http://localhost:5000',
+    // 🔑 CRITICAL FIX: Add the Live Server origin identified in your console
+    'http://127.0.0.1:5500' 
 ];
 
 app.use(cors({
@@ -127,7 +125,7 @@ app.use(cors({
         if (allowedOrigins.includes(origin) || !origin) {
             callback(null, true);
         } else {
-            // This is the line that caused the error in your Render logs
+            // This is the line that was failing because 127.0.0.1:5500 was missing.
             callback(new Error('Not allowed by CORS'), false); 
         }
     },

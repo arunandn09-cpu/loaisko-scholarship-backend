@@ -44,7 +44,8 @@ const FIREBASE_CLIENT_CONFIG = {
 
 // --- Helper: Sync user to Firebase ---
 async function syncUserToFirebase(user) {
-    const { studentNo, email, firstName, middleInitial, lastName, role, course, yearLevel } = user;
+    // ⬇️ UPDATED: Changed middleInitial to middleName
+    const { studentNo, email, firstName, middleName, lastName, role, course, yearLevel } = user;
     let firebaseUid = studentNo;
 
     try {
@@ -63,7 +64,9 @@ async function syncUserToFirebase(user) {
             const newUser = await admin.auth().createUser({
                 uid: studentNo,
                 email,
-                password,
+                // NOTE: Password is NOT available here for creation. 
+                // This sync function should ideally be called AFTER a successful client-side auth.
+                // We'll proceed with the existing structure assuming the studentNo (UID) is known.
                 displayName: `${firstName} ${lastName}`
             });
             firebaseUid = newUser.uid;
@@ -80,7 +83,8 @@ async function syncUserToFirebase(user) {
             firebaseUid,
             studentNo,
             firstName,
-            middleInitial,
+            // ⬇️ UPDATED: Changed middleInitial to middleName
+            middleName,
             lastName,
             email,
             course,
@@ -105,7 +109,7 @@ const checkDbConnection = (req, res, next) => {
 app.use('/api', checkDbConnection);
 
 const verifyAdmin = async (req, res, next) => {
-    console.log("[Middleware] Admin authentication assumed.");
+    console.log("[Middleware] Admin authentication assumed. (WARNING: Implement proper authentication for production.)");
     return next();
 };
 
@@ -115,21 +119,18 @@ const allowedOrigins = [
     'https://loaiskoportal.firebaseapp.com',
     'http://localhost:3000', 
     'http://localhost:5000',
-    // 🔑 CRITICAL FIX: Add the Live Server origin identified in your console
     'http://127.0.0.1:5500' 
 ];
 
 app.use(cors({
     origin: (origin, callback) => {
-        // Allow requests from allowed origins or requests with no origin (like server-to-server or curl)
         if (allowedOrigins.includes(origin) || !origin) {
             callback(null, true);
         } else {
-            // This is the line that was failing because 127.0.0.1:5500 was missing.
             callback(new Error('Not allowed by CORS'), false); 
         }
     },
-    methods: ['GET', 'POST', 'OPTIONS', 'DELETE'], // Ensure DELETE is allowed
+    methods: ['GET', 'POST', 'OPTIONS', 'DELETE'],
     credentials: true
 }));
 // --- END CORS FIX ---
@@ -139,18 +140,26 @@ app.get('/', (req, res) => res.status(200).json({ message: "LOA ISKO API is runn
 
 app.get('/api/firebase-config', (req, res) => res.json(FIREBASE_CLIENT_CONFIG));
 
-// 1️⃣ REGISTER
+// 1️⃣ REGISTER (This route is likely unused by your client, but updated for consistency)
 app.post('/api/register', async (req, res) => {
-    const { firstName, middleInitial, lastName, studentNo, course, yearLevel, email, password } = req.body;
+    // ⬇️ UPDATED: Removed studentNo from destructuring since client no longer provides it 
+    // and changed middleInitial to middleName.
+    const { firstName, middleName, lastName, course, yearLevel, email, password } = req.body;
 
-    if (!email || !password || !studentNo) {
-        return res.status(400).json({ success: false, message: "Email, password, and Student Number required." });
+    // The client-side register form now handles the Firebase Auth part and uses the UID 
+    // as the studentNo. This server route should now primarily handle the MongoDB persistence 
+    // and verification if used. We need to generate a studentNo/UID if we use this route.
+    // For now, we assume this route is primarily used for the legacy MongoDB flow.
+    if (!email || !password) {
+        return res.status(400).json({ success: false, message: "Email and password required." });
     }
 
+    // Since studentNo is required for MongoDB and Firebase Auth UID, we must generate one.
+    // In a real system, this would be a sequence number. We'll use a placeholder UID now.
+    // NOTE: This route should be removed or completely refactored if the client is calling Firebase Auth directly.
+    const generatedStudentNo = admin.firestore().collection('students').doc().id; 
+    
     try {
-        if (await studentsCollection.findOne({ studentNo })) {
-            return res.status(409).json({ success: false, message: "Student Number already registered." });
-        }
         if (await studentsCollection.findOne({ email })) {
             return res.status(409).json({ success: false, message: "Email already registered." });
         }
@@ -158,8 +167,9 @@ app.post('/api/register', async (req, res) => {
         const verificationCode = generateVerificationCode();
         const codeExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
+        // Create Firebase Auth user using the generated ID
         await admin.auth().createUser({
-            uid: studentNo,
+            uid: generatedStudentNo,
             email,
             password,
             displayName: `${firstName} ${lastName}`,
@@ -169,7 +179,12 @@ app.post('/api/register', async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, saltRounds);
 
         await studentsCollection.insertOne({
-            firstName, middleInitial, lastName, studentNo, course, yearLevel, email,
+            firstName, 
+            // ⬇️ UPDATED: Changed middleInitial to middleName
+            middleName, 
+            lastName, 
+            studentNo: generatedStudentNo, // Use generated ID
+            course, yearLevel, email,
             password: hashedPassword,
             role: "student",
             isVerified: false,
@@ -203,6 +218,7 @@ app.post('/api/login-and-sync', async (req, res) => {
         const firebaseUid = await syncUserToFirebase(user);
         const token = await admin.auth().createCustomToken(firebaseUid);
 
+        // ⬇️ UPDATED: The user object passed back should match the MongoDB schema
         res.json({
             success: true,
             message: "Login successful.",
@@ -210,6 +226,8 @@ app.post('/api/login-and-sync', async (req, res) => {
                 studentNo: user.studentNo,
                 firebaseUid,
                 firstName: user.firstName,
+                // ⬇️ UPDATED: Ensure middleName is returned
+                middleName: user.middleName || null, 
                 lastName: user.lastName,
                 email,
                 role: user.role
@@ -222,7 +240,7 @@ app.post('/api/login-and-sync', async (req, res) => {
     }
 });
 
-// 3️⃣ VERIFY CODE
+// 3️⃣ VERIFY CODE (No changes needed)
 app.post('/api/verify-code', async (req, res) => {
     const { email, code } = req.body;
     if (!email || !code) return res.status(400).json({ success: false, message: "Email and code required." });
@@ -254,7 +272,7 @@ app.post('/api/verify-code', async (req, res) => {
     }
 });
 
-// 4️⃣ RESEND VERIFICATION
+// 4️⃣ RESEND VERIFICATION (No changes needed)
 app.post('/api/resend-verification', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ success: false, message: "Email required." });
@@ -277,7 +295,7 @@ app.post('/api/resend-verification', async (req, res) => {
     }
 });
 
-// 5️⃣ ADMIN: SEND STATUS EMAIL
+// 5️⃣ ADMIN: SEND STATUS EMAIL (No changes needed)
 app.post('/api/send-status-email', verifyAdmin, async (req, res) => {
     const { docId, status, email, name, scholarshipType } = req.body;
     if (!status || !email || !name || !scholarshipType) return res.status(400).json({ success: false, message: "Missing fields." });
@@ -291,7 +309,7 @@ app.post('/api/send-status-email', verifyAdmin, async (req, res) => {
     }
 });
 
-// 6️⃣ ADMIN: DELETE STUDENT
+// 6️⃣ ADMIN: DELETE STUDENT (No changes needed)
 app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
     const { studentNo, email } = req.body;
     if (!studentNo || !email) return res.status(400).json({ success: false, message: "UID and email required." });
@@ -306,7 +324,6 @@ app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
         try { await admin.auth().deleteUser(studentNo); authDeleted = true; } 
         catch (e) { 
             console.warn("Firebase Auth deletion warning:", e.message);
-            // Log the error but don't stop the process if the user was already deleted
         }
 
         // Deleting from Firestore (using studentNo as the Document ID)
@@ -317,7 +334,6 @@ app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
         } 
         catch (e) { 
             console.warn("Firestore deletion warning:", e.message); 
-            // Log the error but don't stop the process
         }
 
         if (!mongoDeleted && !authDeleted) return res.status(404).json({ success: false, message: "No record found." });

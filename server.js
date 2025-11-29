@@ -6,6 +6,17 @@ const bcrypt = require('bcrypt');
 // 🎯 SECURE IMPORT: Firebase Admin SDK
 const admin = require('./firebaseAdmin');
 
+// ☁️ CLOUDINARY CONFIGURATION: READING FROM ENV VARIABLES
+const cloudinary = require('cloudinary').v2;
+
+cloudinary.config({
+    // IMPORTANT: These keys MUST be set as environment variables on your Render dashboard.
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+    secure: true,
+});
+
 // ✅ Email service functions
 const {
     generateVerificationCode,
@@ -42,48 +53,60 @@ const FIREBASE_CLIENT_CONFIG = {
     measurementId: process.env.FIREBASE_MEASUREMENT_ID
 };
 
-// --- Helper: Sync user to Firebase ---
+// --- Helper: Sync user to Firebase (Auth & Firestore) ---
+/**
+ * Synchronizes user data from MongoDB to Firebase Auth and Firestore.
+ * @param {Object} user - The user object from MongoDB.
+ * @returns {Promise<string>} - The Firebase UID.
+ */
 async function syncUserToFirebase(user) {
-    // ⬇️ UPDATED: Changed middleInitial to middleName
-    const { studentNo, email, firstName, middleName, lastName, role, course, yearLevel } = user;
-    let firebaseUid = studentNo;
+    // MongoDB user's studentNo is used as the Firebase UID
+    const firebaseUid = user.studentNo; 
+    
+    // Ensure data structure matches expected properties
+    const { 
+        email, 
+        firstName, 
+        middleName, // middleInitial is now middleName
+        lastName, 
+        role, 
+        course, 
+        yearLevel 
+    } = user;
 
+    // --- 1. Firebase Auth Sync ---
     try {
         const isVerified = user.isVerified || false;
 
-        // Update existing user
-        await admin.auth().updateUser(studentNo, {
+        // Try to update existing user
+        await admin.auth().updateUser(firebaseUid, {
             email,
             emailVerified: isVerified,
             displayName: `${firstName} ${lastName}`
         });
 
-        console.log(`🔄 Updated Firebase user: ${studentNo}`);
+        console.log(`🔄 Updated Firebase Auth user: ${firebaseUid}`);
     } catch (error) {
         if (error.code === 'auth/user-not-found') {
-            const newUser = await admin.auth().createUser({
-                uid: studentNo,
+            // Create user if not found (NOTE: Password is still missing here)
+            await admin.auth().createUser({
+                uid: firebaseUid,
                 email,
-                // NOTE: Password is NOT available here for creation. 
-                // This sync function should ideally be called AFTER a successful client-side auth.
-                // We'll proceed with the existing structure assuming the studentNo (UID) is known.
                 displayName: `${firstName} ${lastName}`
             });
-            firebaseUid = newUser.uid;
-            console.log(`✅ Created Firebase user: ${newUser.uid}`);
+            console.log(`✅ Created Firebase Auth user: ${firebaseUid}`);
         } else {
-            throw new Error(`Firebase sync failed: ${error.message}`);
+            console.error("❌ Firebase Auth sync failed:", error);
         }
     }
 
-    // Firestore sync
+    // --- 2. Firestore Sync ---
     try {
         const firestoreDb = admin.firestore();
+        // Use set with merge: true for upserting student data
         await firestoreDb.collection('students').doc(firebaseUid).set({
-            firebaseUid,
-            studentNo,
+            studentNo: firebaseUid, // Ensure studentNo field matches UID
             firstName,
-            // ⬇️ UPDATED: Changed middleInitial to middleName
             middleName,
             lastName,
             email,
@@ -92,6 +115,8 @@ async function syncUserToFirebase(user) {
             role,
             verifiedAt: user.isVerified ? admin.firestore.FieldValue.serverTimestamp() : null
         }, { merge: true });
+        
+        console.log(`✅ Synced user to Firestore: ${firebaseUid}`);
     } catch (firestoreError) {
         console.error("❌ Firestore sync failed:", firestoreError);
     }
@@ -109,6 +134,8 @@ const checkDbConnection = (req, res, next) => {
 app.use('/api', checkDbConnection);
 
 const verifyAdmin = async (req, res, next) => {
+    // ⚠️ SECURITY WARNING: This bypass must be replaced with a real token validation 
+    // using the Firebase Admin SDK for production environments.
     console.log("[Middleware] Admin authentication assumed. (WARNING: Implement proper authentication for production.)");
     return next();
 };
@@ -122,11 +149,14 @@ const allowedOrigins = [
     'http://127.0.0.1:5500' 
 ];
 
+// 💡 IMPROVED CORS CONFIGURATION
 app.use(cors({
     origin: (origin, callback) => {
         if (allowedOrigins.includes(origin) || !origin) {
             callback(null, true);
         } else {
+            // Log the disallowed origin for debugging
+            console.warn(`CORS blocked request from origin: ${origin}`);
             callback(new Error('Not allowed by CORS'), false); 
         }
     },
@@ -140,26 +170,19 @@ app.get('/', (req, res) => res.status(200).json({ message: "LOA ISKO API is runn
 
 app.get('/api/firebase-config', (req, res) => res.json(FIREBASE_CLIENT_CONFIG));
 
-// 1️⃣ REGISTER (This route is likely unused by your client, but updated for consistency)
+// 1️⃣ REGISTER
 app.post('/api/register', async (req, res) => {
-    // ⬇️ UPDATED: Removed studentNo from destructuring since client no longer provides it 
-    // and changed middleInitial to middleName.
+    // Ensure all required fields are present
     const { firstName, middleName, lastName, course, yearLevel, email, password } = req.body;
-
-    // The client-side register form now handles the Firebase Auth part and uses the UID 
-    // as the studentNo. This server route should now primarily handle the MongoDB persistence 
-    // and verification if used. We need to generate a studentNo/UID if we use this route.
-    // For now, we assume this route is primarily used for the legacy MongoDB flow.
     if (!email || !password) {
         return res.status(400).json({ success: false, message: "Email and password required." });
     }
 
-    // Since studentNo is required for MongoDB and Firebase Auth UID, we must generate one.
-    // In a real system, this would be a sequence number. We'll use a placeholder UID now.
-    // NOTE: This route should be removed or completely refactored if the client is calling Firebase Auth directly.
+    // Use a placeholder UID/studentNo (e.g., Firestore doc ID) since the client doesn't provide it
     const generatedStudentNo = admin.firestore().collection('students').doc().id; 
     
     try {
+        // Check for existing user in MongoDB
         if (await studentsCollection.findOne({ email })) {
             return res.status(409).json({ success: false, message: "Email already registered." });
         }
@@ -167,7 +190,7 @@ app.post('/api/register', async (req, res) => {
         const verificationCode = generateVerificationCode();
         const codeExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
-        // Create Firebase Auth user using the generated ID
+        // Create Firebase Auth user
         await admin.auth().createUser({
             uid: generatedStudentNo,
             email,
@@ -176,14 +199,15 @@ app.post('/api/register', async (req, res) => {
             emailVerified: false
         });
 
+        // Hash password for MongoDB storage
         const hashedPassword = await bcrypt.hash(password, saltRounds);
 
+        // Insert into MongoDB
         await studentsCollection.insertOne({
             firstName, 
-            // ⬇️ UPDATED: Changed middleInitial to middleName
-            middleName, 
+            middleName, // Updated field name
             lastName, 
-            studentNo: generatedStudentNo, // Use generated ID
+            studentNo: generatedStudentNo,
             course, yearLevel, email,
             password: hashedPassword,
             role: "student",
@@ -197,7 +221,8 @@ app.post('/api/register', async (req, res) => {
 
         res.json({ success: true, message: "Registration successful. Verification code sent.", needsVerification: true });
     } catch (error) {
-        console.error(error);
+        // Handle Firebase/MongoDB creation errors
+        console.error("Registration error:", error);
         res.status(500).json({ success: false, message: "Registration failed." });
     }
 });
@@ -215,10 +240,13 @@ app.post('/api/login-and-sync', async (req, res) => {
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) return res.status(401).json({ success: false, message: "Invalid email or password." });
 
+        // Sync MongoDB user data to Firebase Auth and Firestore
         const firebaseUid = await syncUserToFirebase(user);
+        
+        // Create custom token for client-side Firebase Auth
         const token = await admin.auth().createCustomToken(firebaseUid);
 
-        // ⬇️ UPDATED: The user object passed back should match the MongoDB schema
+        // Return necessary user data and custom token
         res.json({
             success: true,
             message: "Login successful.",
@@ -226,8 +254,7 @@ app.post('/api/login-and-sync', async (req, res) => {
                 studentNo: user.studentNo,
                 firebaseUid,
                 firstName: user.firstName,
-                // ⬇️ UPDATED: Ensure middleName is returned
-                middleName: user.middleName || null, 
+                middleName: user.middleName || null, // Ensure middleName is returned
                 lastName: user.lastName,
                 email,
                 role: user.role
@@ -235,12 +262,12 @@ app.post('/api/login-and-sync', async (req, res) => {
             token
         });
     } catch (error) {
-        console.error(error);
+        console.error("Login error:", error);
         res.status(500).json({ success: false, message: "Login failed." });
     }
 });
 
-// 3️⃣ VERIFY CODE (No changes needed)
+// 3️⃣ VERIFY CODE
 app.post('/api/verify-code', async (req, res) => {
     const { email, code } = req.body;
     if (!email || !code) return res.status(400).json({ success: false, message: "Email and code required." });
@@ -257,22 +284,24 @@ app.post('/api/verify-code', async (req, res) => {
             return res.status(400).json({ success: false, message: "Code expired. Request new code." });
         }
 
+        // 1. Update MongoDB
         await studentsCollection.updateOne(
             { email },
             { $set: { isVerified: true, verifiedAt: new Date() }, $unset: { verificationCode: "", codeExpiresAt: "" } }
         );
 
+        // 2. Update Firebase Auth and Firestore
         await admin.auth().updateUser(user.studentNo, { emailVerified: true });
         await syncUserToFirebase({ ...user, isVerified: true });
 
         res.json({ success: true, message: "Email verified. You can log in.", userEmail: email });
     } catch (error) {
-        console.error(error);
+        console.error("Verification error:", error);
         res.status(500).json({ success: false, message: "Verification failed." });
     }
 });
 
-// 4️⃣ RESEND VERIFICATION (No changes needed)
+// 4️⃣ RESEND VERIFICATION
 app.post('/api/resend-verification', async (req, res) => {
     const { email } = req.body;
     if (!email) return res.status(400).json({ success: false, message: "Email required." });
@@ -290,12 +319,12 @@ app.post('/api/resend-verification', async (req, res) => {
 
         res.json({ success: true, message: `New code sent to ${email}.` });
     } catch (error) {
-        console.error(error);
+        console.error("Resend verification error:", error);
         res.status(500).json({ success: false, message: "Resend failed." });
     }
 });
 
-// 5️⃣ ADMIN: SEND STATUS EMAIL (No changes needed)
+// 5️⃣ ADMIN: SEND STATUS EMAIL
 app.post('/api/send-status-email', verifyAdmin, async (req, res) => {
     const { docId, status, email, name, scholarshipType } = req.body;
     if (!status || !email || !name || !scholarshipType) return res.status(400).json({ success: false, message: "Missing fields." });
@@ -304,12 +333,12 @@ app.post('/api/send-status-email', verifyAdmin, async (req, res) => {
         await sendApplicationStatusEmail(email, name, scholarshipType, status);
         res.json({ success: true, message: `Status email sent to ${email}.` });
     } catch (error) {
-        console.error(error);
+        console.error("Send status email error:", error);
         res.status(500).json({ success: false, message: "Failed to send status email." });
     }
 });
 
-// 6️⃣ ADMIN: DELETE STUDENT (No changes needed)
+// 6️⃣ ADMIN: DELETE STUDENT
 app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
     const { studentNo, email } = req.body;
     if (!studentNo || !email) return res.status(400).json({ success: false, message: "UID and email required." });
@@ -317,30 +346,35 @@ app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
     let mongoDeleted = false, authDeleted = false;
 
     try {
+        // 1. Delete from MongoDB
         const mongoResult = await studentsCollection.deleteOne({ email });
         mongoDeleted = mongoResult.deletedCount > 0;
 
-        // Deleting from Firebase Auth (using studentNo as the UID)
-        try { await admin.auth().deleteUser(studentNo); authDeleted = true; } 
+        // 2. Delete from Firebase Auth (using studentNo as the UID)
+        try { 
+            await admin.auth().deleteUser(studentNo); 
+            authDeleted = true; 
+        } 
         catch (e) { 
-            console.warn("Firebase Auth deletion warning:", e.message);
+            console.warn("Firebase Auth deletion warning (user might not exist):", e.message);
         }
 
-        // Deleting from Firestore (using studentNo as the Document ID)
+        // 3. Delete from Firestore (using studentNo as the Document ID)
         try {
             const firestoreDb = admin.firestore();
             await firestoreDb.collection('students').doc(studentNo).delete();
+            // Assuming 'student_profiles' is another collection keyed by UID
             await firestoreDb.collection('student_profiles').doc(studentNo).delete();
         } 
         catch (e) { 
-            console.warn("Firestore deletion warning:", e.message); 
+            console.warn("Firestore deletion warning (doc might not exist):", e.message); 
         }
 
         if (!mongoDeleted && !authDeleted) return res.status(404).json({ success: false, message: "No record found." });
 
         res.json({ success: true, message: "Student deleted.", mongoDeleted, authDeleted });
     } catch (error) {
-        console.error(error);
+        console.error("Deletion error:", error);
         res.status(500).json({ success: false, message: "Deletion failed." });
     }
 });
@@ -357,6 +391,8 @@ async function initializeServer() {
         const db = client.db(DB_NAME);
         studentsCollection = db.collection(STUDENTS_COLLECTION);
         applicationsCollection = db.collection(APPLICATIONS_COLLECTION);
+        
+        // Ensure indexes exist for fast lookups
         await studentsCollection.createIndex({ studentNo: 1 }, { unique: true });
         await studentsCollection.createIndex({ email: 1 }, { unique: true });
 

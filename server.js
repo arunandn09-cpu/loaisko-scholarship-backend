@@ -25,10 +25,11 @@ const {
 } = require('./emailService');
 
 // --- 1. CORE EXPRESS INITIALIZATION ---
+// NOTE: Increased limit for handling large Base64 document strings
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '50mb' })); // ⬅️ IMPORTANT: Increase payload limit
 app.use(express.static('public'));
 
 // 🎯 MongoDB CONFIG
@@ -41,6 +42,7 @@ const saltRounds = 10;
 const client = new MongoClient(uri);
 let studentsCollection;
 let applicationsCollection;
+const firestoreDb = admin.firestore(); // Initialize Firestore instance
 
 // 🔑 Firebase Client Config
 const FIREBASE_CLIENT_CONFIG = {
@@ -102,7 +104,6 @@ async function syncUserToFirebase(user) {
 
     // --- 2. Firestore Sync ---
     try {
-        const firestoreDb = admin.firestore();
         // Use set with merge: true for upserting student data
         await firestoreDb.collection('students').doc(firebaseUid).set({
             studentNo: firebaseUid, // Ensure studentNo field matches UID
@@ -124,6 +125,33 @@ async function syncUserToFirebase(user) {
     return firebaseUid;
 }
 
+// --- CLOUDINARY UPLOAD HELPER WITH PREVIEW FIX ---
+/**
+ * Uploads a document (Base64 data) to Cloudinary and returns the URL.
+ * FIX: Sets resource_type to 'auto' to enable in-browser previewing (PDFs, images) 
+ * instead of forcing download.
+ * @param {string} fileData - Base64 encoded file string.
+ * @param {string} userId - ID of the user (for folder organization).
+ * @param {string} docType - Type of document (e.g., 'studentId', 'grades').
+ * @returns {Promise<string>} - The secure Cloudinary URL.
+ */
+async function uploadDocumentToCloudinary(fileData, userId, docType) {
+    if (!fileData) throw new Error("File data is required for upload.");
+
+    const publicId = `${userId}/${docType}_${Date.now()}`;
+
+    // 🏆 THE CRITICAL FIX IS HERE: resource_type: 'auto'
+    const result = await cloudinary.uploader.upload(fileData, {
+        public_id: publicId,
+        folder: `application_documents/${userId}`,
+        resource_type: 'auto', // ✅ Ensures preview mode for PDFs/Images
+        overwrite: true,
+        quality: 'auto:low' // Optimization
+    });
+    
+    return result.secure_url;
+}
+
 // --- MIDDLEWARE ---
 const checkDbConnection = (req, res, next) => {
     if (!studentsCollection || !applicationsCollection) {
@@ -133,10 +161,31 @@ const checkDbConnection = (req, res, next) => {
 };
 app.use('/api', checkDbConnection);
 
+/**
+ * Middleware to verify Firebase ID Token and attach decoded token to request.
+ */
+const verifyToken = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ success: false, message: 'Authorization token not provided.' });
+    }
+    const idToken = authHeader.split('Bearer ')[1];
+
+    try {
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        req.user = decodedToken;
+        next();
+    } catch (error) {
+        console.error("Error verifying token:", error.message);
+        return res.status(403).json({ success: false, message: 'Invalid or expired token.' });
+    }
+};
+
 const verifyAdmin = async (req, res, next) => {
     // ⚠️ SECURITY WARNING: This bypass must be replaced with a real token validation 
     // using the Firebase Admin SDK for production environments.
     console.log("[Middleware] Admin authentication assumed. (WARNING: Implement proper authentication for production.)");
+    // In a real app, you would check req.user.role === 'admin' 
     return next();
 };
 
@@ -169,6 +218,57 @@ app.use(cors({
 app.get('/', (req, res) => res.status(200).json({ message: "LOA ISKO API is running" }));
 
 app.get('/api/firebase-config', (req, res) => res.json(FIREBASE_CLIENT_CONFIG));
+
+// 7️⃣ NEW: DOCUMENT UPLOAD ROUTE
+app.post('/api/upload-document', verifyToken, async (req, res) => {
+    const { userId, fileData, docType, filename, mimeType } = req.body;
+
+    // Use the verified token's UID for security, not the body's userId
+    const authenticatedUserId = req.user.uid; 
+    
+    if (authenticatedUserId !== userId) {
+         return res.status(403).json({ success: false, message: "Unauthorized access attempt for another user's files." });
+    }
+
+    if (!userId || !fileData || !docType) {
+        return res.status(400).json({ success: false, message: "Missing required file upload parameters." });
+    }
+    
+    // Ensure the file data is properly prefixed for Cloudinary (e.g., "data:image/png;base64,...")
+    const prefixedFileData = fileData.startsWith('data:') ? fileData : `${mimeType ? `data:${mimeType}` : 'data:application/octet-stream'};base64,${fileData}`;
+
+    try {
+        const fileUrl = await uploadDocumentToCloudinary(prefixedFileData, userId, docType);
+        
+        // Data structure to save to Firestore's 'applications_files' collection
+        const documentInfo = {
+            url: fileUrl,
+            data: null, // Clear Base64 data once URL is generated
+            filename: filename || `${docType}_file`,
+            type: mimeType || 'application/octet-stream',
+            uploadedAt: admin.firestore.FieldValue.serverTimestamp()
+        };
+        
+        // Atomically update the specific document type within the 'documents' map
+        const fileDocRef = firestoreDb.collection('applications_files').doc(userId);
+        await fileDocRef.set({
+            userId: userId,
+            documents: {
+                [docType]: documentInfo
+            }
+        }, { merge: true });
+
+        res.json({ 
+            success: true, 
+            message: `${docType} uploaded successfully.`,
+            documentInfo: documentInfo
+        });
+
+    } catch (error) {
+        console.error(`Cloudinary upload or Firestore update error for ${docType}:`, error);
+        res.status(500).json({ success: false, message: `File upload failed for ${docType}.` });
+    }
+});
 
 // 1️⃣ REGISTER
 app.post('/api/register', async (req, res) => {
@@ -361,7 +461,6 @@ app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
 
         // 3. Delete from Firestore (using studentNo as the Document ID)
         try {
-            const firestoreDb = admin.firestore();
             await firestoreDb.collection('students').doc(studentNo).delete();
             // Assuming 'student_profiles' is another collection keyed by UID
             await firestoreDb.collection('student_profiles').doc(studentNo).delete();

@@ -21,6 +21,7 @@
   "homepage": "https://github.com/arunandn09-cpu/loaisko-scholarship-backend#readme",
   "dependencies": {
     "bcrypt": "^6.0.0",
+    "cloudinary": "^2.8.0",
     "cors": "^2.8.5",
     "express": "^5.1.0",
     "firebase": "^12.6.0",

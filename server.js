@@ -152,6 +152,19 @@ async function uploadDocumentToCloudinary(fileData, userId, docType) {
     return result.secure_url;
 }
 
+/**
+ * Saves the Cloudinary URL and metadata to the dedicated applications_files collection.
+ * This is the assumed logic based on your frontend fetching code (admin_documents.js).
+ */
+async function saveApplicationFilesToFirestore(userId, documents) {
+    const fileDocRef = firestoreDb.collection('applications_files').doc(userId);
+    await fileDocRef.set({
+        userId: userId,
+        documents: documents,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true }); // Use merge: true to avoid overwriting the entire document
+}
+
 // --- MIDDLEWARE ---
 const checkDbConnection = (req, res, next) => {
     if (!studentsCollection || !applicationsCollection) {
@@ -219,7 +232,7 @@ app.get('/', (req, res) => res.status(200).json({ message: "LOA ISKO API is runn
 
 app.get('/api/firebase-config', (req, res) => res.json(FIREBASE_CLIENT_CONFIG));
 
-// 7️⃣ NEW: DOCUMENT UPLOAD ROUTE
+// 7️⃣ NEW: DOCUMENT UPLOAD ROUTE (Standalone - for individual file submissions)
 app.post('/api/upload-document', verifyToken, async (req, res) => {
     const { userId, fileData, docType, filename, mimeType } = req.body;
 
@@ -267,6 +280,77 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
     } catch (error) {
         console.error(`Cloudinary upload or Firestore update error for ${docType}:`, error);
         res.status(500).json({ success: false, message: `File upload failed for ${docType}.` });
+    }
+});
+
+// 8️⃣ NEW: APPLICATION SUBMISSION ROUTE (Handles all data + uploads)
+app.post('/api/submit-application', verifyToken, async (req, res) => {
+    const { 
+        userId, 
+        studentId, 
+        applicationData, 
+        documents: documentsToUpload // This should be an object containing docType: { fileData, filename, mimeType }
+    } = req.body;
+
+    const authenticatedUserId = req.user.uid; 
+    
+    if (authenticatedUserId !== userId || authenticatedUserId !== studentId) {
+         return res.status(403).json({ success: false, message: "Unauthorized submission." });
+    }
+    
+    if (!applicationData || !documentsToUpload) {
+        return res.status(400).json({ success: false, message: "Missing application data or documents." });
+    }
+    
+    let uploadedDocuments = {};
+
+    try {
+        // --- 1. Upload Documents to Cloudinary ---
+        for (const docType in documentsToUpload) {
+            const { fileData, filename, mimeType } = documentsToUpload[docType];
+            
+            if (fileData) {
+                const prefixedFileData = fileData.startsWith('data:') ? fileData : `${mimeType ? `data:${mimeType}` : 'data:application/octet-stream'};base64,${fileData}`;
+                
+                // CRITICAL CALL: Upload using the function that has the 'resource_type: auto' fix
+                const fileUrl = await uploadDocumentToCloudinary(prefixedFileData, userId, docType);
+                
+                uploadedDocuments[docType] = {
+                    url: fileUrl,
+                    data: null, // IMPORTANT: Strip Base64 data from what's stored in Firestore
+                    filename: filename || `${docType}_file`,
+                    type: mimeType || 'application/octet-stream'
+                };
+            }
+        }
+        
+        // --- 2. Save Document URLs to applications_files collection ---
+        await saveApplicationFilesToFirestore(userId, uploadedDocuments);
+
+        // --- 3. Save Main Application Data to scholarship_applications collection ---
+        const finalApplicationData = {
+            ...applicationData,
+            userId,
+            studentId, // studentId is often the same as userId/UID
+            status: "Submitted",
+            submittedAt: admin.firestore.FieldValue.serverTimestamp()
+            // NOTE: We no longer save the full document data in the application document
+        };
+        
+        // You may want to check if the student already has an application, and if so, update/reject.
+        await firestoreDb.collection('scholarship_applications').add(finalApplicationData);
+
+
+        res.json({
+            success: true,
+            message: "Application and documents submitted successfully.",
+            applicationId: finalApplicationData.id,
+            uploadedDocuments: uploadedDocuments // Return the URLs for confirmation
+        });
+
+    } catch (error) {
+        console.error("Application submission failed:", error);
+        res.status(500).json({ success: false, message: "Application submission failed due to a server or file upload error." });
     }
 });
 

@@ -125,32 +125,58 @@ async function syncUserToFirebase(user) {
     return firebaseUid;
 }
 
-// --- CLOUDINARY UPLOAD HELPER WITH PREVIEW FIX ---
+// --- CLOUDINARY UPLOAD HELPER WITH OCR INTEGRATION ---
 /**
- * Uploads a document (Base64 data) to Cloudinary and returns the URL.
- * FIX: Sets resource_type to 'auto' to enable in-browser previewing (PDFs, images) 
- * instead of forcing download.
+ * Uploads a document (Base64 data) to Cloudinary, runs OCR if needed, and returns 
+ * the URL and OCR result.
  * @param {string} fileData - Base64 encoded file string.
  * @param {string} userId - ID of the user (for folder organization).
- * @param {string} docType - Type of document (e.g., 'studentId', 'grades').
- * @returns {Promise<string>} - The secure Cloudinary URL.
+ * @param {string} docType - Type of document (e.g., 'certificateOfGrades', 'studentId').
+ * @returns {Promise<{url: string, ocr_result: Object|null}>} - The URL and OCR data.
  */
 async function uploadDocumentToCloudinary(fileData, userId, docType) {
     if (!fileData) throw new Error("File data is required for upload.");
 
     const publicId = `${userId}/${docType}_${Date.now()}`;
+    let ocrResult = null;
+    let explicitEager = [];
 
-    // 🏆 THE CRITICAL FIX IS HERE: resource_type: 'auto'
+    // CRITICAL: Only run OCR on documents that require verification/data extraction
+    if (docType === 'certificateOfGrades' || docType === 'grades') {
+        // Add the Advanced OCR instruction for documents where GWA/text is needed
+        explicitEager.push({ raw_convert: 'adv_ocr' });
+    }
+
+    // 1. Upload the file and optionally run OCR as an 'eager' transformation
     const result = await cloudinary.uploader.upload(fileData, {
         public_id: publicId,
         folder: `application_documents/${userId}`,
-        resource_type: 'auto', // ✅ Ensures preview mode for PDFs/Images
+        resource_type: 'auto', // Ensures preview mode for PDFs/Images
         overwrite: true,
-        quality: 'auto:low' // Optimization
+        quality: 'auto:low', // Optimization
+        eager: explicitEager, // Run OCR during upload if requested
+        resource_type: 'image' // Force resource_type to image for Cloudinary's OCR to work on PDFs
     });
     
-    return result.secure_url;
+    // 2. Extract OCR data from the response if it was requested
+    if (result.eager && result.eager.length > 0) {
+        const ocrData = result.eager.find(e => e.raw_convert === 'adv_ocr');
+        if (ocrData && ocrData.response) {
+            try {
+                // The response is a stringified JSON, so we parse it
+                ocrResult = JSON.parse(ocrData.response); 
+            } catch (e) {
+                console.warn("Could not parse OCR response JSON:", e);
+            }
+        }
+    }
+    
+    return {
+        url: result.secure_url,
+        ocr_result: ocrResult
+    };
 }
+
 
 /**
  * Saves the Cloudinary URL and metadata to the dedicated applications_files collection.
@@ -240,7 +266,7 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
     const authenticatedUserId = req.user.uid; 
     
     if (authenticatedUserId !== userId) {
-         return res.status(403).json({ success: false, message: "Unauthorized access attempt for another user's files." });
+        return res.status(403).json({ success: false, message: "Unauthorized access attempt for another user's files." });
     }
 
     if (!userId || !fileData || !docType) {
@@ -251,12 +277,14 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
     const prefixedFileData = fileData.startsWith('data:') ? fileData : `${mimeType ? `data:${mimeType}` : 'data:application/octet-stream'};base64,${fileData}`;
 
     try {
-        const fileUrl = await uploadDocumentToCloudinary(prefixedFileData, userId, docType);
+        // 🏆 CRITICAL CHANGE: Call the updated helper to get URL AND OCR result
+        const { url: fileUrl, ocr_result } = await uploadDocumentToCloudinary(prefixedFileData, userId, docType);
         
         // Data structure to save to Firestore's 'applications_files' collection
         const documentInfo = {
             url: fileUrl,
-            data: null, // Clear Base64 data once URL is generated
+            // We now store the OCR result alongside the URL
+            ocr_result: ocr_result, 
             filename: filename || `${docType}_file`,
             type: mimeType || 'application/octet-stream',
             uploadedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -273,7 +301,7 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
 
         res.json({ 
             success: true, 
-            message: `${docType} uploaded successfully.`,
+            message: `${docType} uploaded successfully. OCR status: ${ocr_result ? 'Processed' : 'N/A'}`,
             documentInfo: documentInfo
         });
 
@@ -296,7 +324,7 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
     
     // Check if the user ID from the token matches the ID sent in the request
     if (authenticatedUserId !== userId || authenticatedUserId !== studentId) {
-         return res.status(403).json({ success: false, message: "Unauthorized submission: User ID mismatch." });
+        return res.status(403).json({ success: false, message: "Unauthorized submission: User ID mismatch." });
     }
     
     if (!applicationData || !documentsToUpload) {
@@ -309,7 +337,7 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
     const applicationId = newAppRef.id;
 
     try {
-        // --- 1. Upload Documents to Cloudinary ---
+        // --- 1. Upload Documents to Cloudinary (with OCR) ---
         for (const docType in documentsToUpload) {
             const { fileData, filename, mimeType } = documentsToUpload[docType];
             
@@ -317,12 +345,12 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
                 // IMPORTANT: Ensure the Base64 data is correctly formatted
                 const prefixedFileData = fileData.startsWith('data:') ? fileData : `${mimeType ? `data:${mimeType}` : 'data:application/octet-stream'};base64,${fileData}`;
                 
-                // CRITICAL CALL: Upload using the function that has the 'resource_type: auto' fix
-                const fileUrl = await uploadDocumentToCloudinary(prefixedFileData, userId, docType);
+                // 🏆 CRITICAL CHANGE: Call the updated helper
+                const { url: fileUrl, ocr_result } = await uploadDocumentToCloudinary(prefixedFileData, userId, docType);
                 
                 uploadedDocuments[docType] = {
                     url: fileUrl,
-                    // data: null, // IMPORTANT: The data field is no longer needed/used here
+                    ocr_result: ocr_result, // <-- OCR result is now included
                     filename: filename || `${docType}_file`,
                     type: mimeType || 'application/octet-stream',
                     uploadedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -330,8 +358,8 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
             }
         }
         
-        // --- 2. Save Document URLs to applications_files collection ---
-        // This stores ALL uploaded files for the user under their UID
+        // --- 2. Save Document URLs and OCR Data to applications_files collection ---
+        // This stores ALL uploaded files and their OCR data for the user under their UID
         await saveApplicationFilesToFirestore(userId, uploadedDocuments);
 
         // --- 3. Save Main Application Data to scholarship_applications collection ---
@@ -361,7 +389,7 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
 
         res.status(200).json({
             success: true,
-            message: "Application and documents submitted successfully.",
+            message: "Application, documents, and OCR analysis submitted successfully.",
             applicationId: applicationId,
             // Return the final data which includes the determined status
             applicationData: finalApplicationData, 

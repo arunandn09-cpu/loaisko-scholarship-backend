@@ -176,11 +176,14 @@ async function uploadDocumentToCloudinary(fileData, userId, docType) {
 
 /**
  * Saves the Cloudinary URL and metadata to the dedicated applications_files collection.
+ * 🟢 MODIFIED: Accepts applicationId for better indexing and retrieval.
  */
-async function saveApplicationFilesToFirestore(userId, documents) {
-    const fileDocRef = firestoreDb.collection('applications_files').doc(userId);
+async function saveApplicationFilesToFirestore(applicationId, documents) { 
+    // This function should save documents keyed by the application ID, not the user ID, 
+    // as an app ID is unique for each application submission.
+    const fileDocRef = firestoreDb.collection('applications_files').doc(applicationId); 
     await fileDocRef.set({
-        userId: userId,
+        applicationId: applicationId,
         documents: documents,
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
     }, { merge: true }); 
@@ -249,7 +252,7 @@ app.get('/', (req, res) => res.status(200).json({ message: "LOA ISKO API is runn
 
 app.get('/api/firebase-config', (req, res) => res.json(FIREBASE_CLIENT_CONFIG));
 
-// 7️⃣ NEW: DOCUMENT UPLOAD ROUTE (Standalone - for individual file submissions)
+// 7️⃣ DOCUMENT UPLOAD ROUTE (Standalone - for individual file submissions)
 app.post('/api/upload-document', verifyToken, async (req, res) => {
     const { userId, fileData, docType, filename, mimeType } = req.body;
     const authenticatedUserId = req.user.uid; 
@@ -263,7 +266,10 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
     }
     
     const prefixedFileData = fileData.startsWith('data:') ? fileData : `${mimeType ? `data:${mimeType}` : 'data:application/octet-stream'};base64,${fileData}`;
-
+    
+    // Generate a temporary application ID for standalone document updates
+    const tempApplicationId = req.body.applicationId || userId; 
+    
     try {
         // 🏆 CRITICAL CHANGE: Get URL AND OCR result
         const { url: fileUrl, ocr_result } = await uploadDocumentToCloudinary(prefixedFileData, userId, docType);
@@ -278,7 +284,8 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
         };
         
         // Atomically update the specific document type within the 'documents' map
-        const fileDocRef = firestoreDb.collection('applications_files').doc(userId);
+        // 🟢 FIX: Use a better ID for single document uploads, often still keyed by User ID if not part of an application
+        const fileDocRef = firestoreDb.collection('applications_files').doc(userId); 
         await fileDocRef.set({
             userId: userId,
             documents: {
@@ -298,7 +305,7 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
     }
 });
 
-// 8️⃣ NEW: APPLICATION SUBMISSION ROUTE (Handles all data + uploads)
+// 8️⃣ APPLICATION SUBMISSION ROUTE (Handles all data + uploads)
 app.post('/api/submit-application', verifyToken, async (req, res) => {
     const { 
         userId, 
@@ -343,7 +350,8 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
         }
         
         // --- 2. Save Document URLs and OCR Data to applications_files collection ---
-        await saveApplicationFilesToFirestore(userId, uploadedDocuments);
+        // 🟢 FIX: Pass the applicationId
+        await saveApplicationFilesToFirestore(applicationId, uploadedDocuments); 
 
         // --- 3. Save Main Application Data to scholarship_applications collection ---
         const finalApplicationData = {

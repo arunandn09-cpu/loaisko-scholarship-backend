@@ -58,18 +58,14 @@ const FIREBASE_CLIENT_CONFIG = {
 // --- Helper: Sync user to Firebase (Auth & Firestore) ---
 /**
  * Synchronizes user data from MongoDB to Firebase Auth and Firestore.
- * @param {Object} user - The user object from MongoDB.
- * @returns {Promise<string>} - The Firebase UID.
  */
 async function syncUserToFirebase(user) {
-    // MongoDB user's studentNo is used as the Firebase UID
     const firebaseUid = user.studentNo; 
     
-    // Ensure data structure matches expected properties
     const { 
         email, 
         firstName, 
-        middleName, // middleInitial is now middleName
+        middleName, 
         lastName, 
         role, 
         course, 
@@ -79,18 +75,14 @@ async function syncUserToFirebase(user) {
     // --- 1. Firebase Auth Sync ---
     try {
         const isVerified = user.isVerified || false;
-
-        // Try to update existing user
         await admin.auth().updateUser(firebaseUid, {
             email,
             emailVerified: isVerified,
             displayName: `${firstName} ${lastName}`
         });
-
         console.log(`🔄 Updated Firebase Auth user: ${firebaseUid}`);
     } catch (error) {
         if (error.code === 'auth/user-not-found') {
-            // Create user if not found (NOTE: Password is still missing here)
             await admin.auth().createUser({
                 uid: firebaseUid,
                 email,
@@ -104,9 +96,8 @@ async function syncUserToFirebase(user) {
 
     // --- 2. Firestore Sync ---
     try {
-        // Use set with merge: true for upserting student data
         await firestoreDb.collection('students').doc(firebaseUid).set({
-            studentNo: firebaseUid, // Ensure studentNo field matches UID
+            studentNo: firebaseUid, 
             firstName,
             middleName,
             lastName,
@@ -125,7 +116,7 @@ async function syncUserToFirebase(user) {
     return firebaseUid;
 }
 
-// --- CLOUDINARY UPLOAD HELPER WITH OCR INTEGRATION ---
+// --- 🏆 CRITICAL UPDATE: CLOUDINARY UPLOAD HELPER WITH OCR INTEGRATION ---
 /**
  * Uploads a document (Base64 data) to Cloudinary, runs OCR if needed, and returns 
  * the URL and OCR result.
@@ -140,22 +131,24 @@ async function uploadDocumentToCloudinary(fileData, userId, docType) {
     const publicId = `${userId}/${docType}_${Date.now()}`;
     let ocrResult = null;
     let explicitEager = [];
+    let resourceType = 'auto'; // Default for flexibility
 
-    // CRITICAL: Only run OCR on documents that require verification/data extraction
+    // 🏆 OCR LOGIC: Only run Advanced OCR on documents that require verification/data extraction
     if (docType === 'certificateOfGrades' || docType === 'grades') {
-        // Add the Advanced OCR instruction for documents where GWA/text is needed
+        // Add the Advanced OCR instruction
         explicitEager.push({ raw_convert: 'adv_ocr' });
+        // NOTE: Cloudinary sometimes requires resource_type to be 'image' for OCR on PDFs/docs
+        resourceType = 'image'; 
     }
 
     // 1. Upload the file and optionally run OCR as an 'eager' transformation
     const result = await cloudinary.uploader.upload(fileData, {
         public_id: publicId,
         folder: `application_documents/${userId}`,
-        resource_type: 'auto', // Ensures preview mode for PDFs/Images
+        resource_type: resourceType, // Use 'image' for OCR, 'auto' otherwise
         overwrite: true,
         quality: 'auto:low', // Optimization
         eager: explicitEager, // Run OCR during upload if requested
-        resource_type: 'image' // Force resource_type to image for Cloudinary's OCR to work on PDFs
     });
     
     // 2. Extract OCR data from the response if it was requested
@@ -163,28 +156,29 @@ async function uploadDocumentToCloudinary(fileData, userId, docType) {
         const ocrData = result.eager.find(e => e.raw_convert === 'adv_ocr');
         if (ocrData && ocrData.response) {
             try {
-                // The response is a stringified JSON, so we parse it
+                // The response is a stringified JSON (text/plain output), parse it 
+                // to save as a Firestore Map.
                 ocrResult = JSON.parse(ocrData.response); 
             } catch (e) {
                 console.warn("Could not parse OCR response JSON:", e);
+                // If parsing fails, try saving the raw response string
+                ocrResult = ocrData.response; 
             }
         }
     }
     
     return {
         url: result.secure_url,
-        ocr_result: ocrResult
+        ocr_result: ocrResult // <-- The OCR result is now returned
     };
 }
 
 
 /**
  * Saves the Cloudinary URL and metadata to the dedicated applications_files collection.
- * This is the assumed logic based on your frontend fetching code (admin_documents.js).
  */
 async function saveApplicationFilesToFirestore(userId, documents) {
     const fileDocRef = firestoreDb.collection('applications_files').doc(userId);
-    // CRITICAL: Use set with merge true to update fields, or else it may overwrite the whole document
     await fileDocRef.set({
         userId: userId,
         documents: documents,
@@ -223,8 +217,7 @@ const verifyToken = async (req, res, next) => {
 
 const verifyAdmin = async (req, res, next) => {
     // ⚠️ SECURITY WARNING: This bypass must be replaced with a real token validation 
-    // using the Firebase Admin SDK for production environments.
-    // In a real app, you would check req.user.role === 'admin' 
+    // and role check for production environments.
     return next(); // Temporarily bypass for local admin testing
 };
 
@@ -237,13 +230,11 @@ const allowedOrigins = [
     'http://127.0.0.1:5500' 
 ];
 
-// 💡 IMPROVED CORS CONFIGURATION
 app.use(cors({
     origin: (origin, callback) => {
         if (allowedOrigins.includes(origin) || !origin) {
             callback(null, true);
         } else {
-            // Log the disallowed origin for debugging
             console.warn(`CORS blocked request from origin: ${origin}`);
             callback(new Error('Not allowed by CORS'), false); 
         }
@@ -261,8 +252,6 @@ app.get('/api/firebase-config', (req, res) => res.json(FIREBASE_CLIENT_CONFIG));
 // 7️⃣ NEW: DOCUMENT UPLOAD ROUTE (Standalone - for individual file submissions)
 app.post('/api/upload-document', verifyToken, async (req, res) => {
     const { userId, fileData, docType, filename, mimeType } = req.body;
-
-    // Use the verified token's UID for security, not the body's userId
     const authenticatedUserId = req.user.uid; 
     
     if (authenticatedUserId !== userId) {
@@ -273,18 +262,16 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
         return res.status(400).json({ success: false, message: "Missing required file upload parameters." });
     }
     
-    // Ensure the file data is properly prefixed for Cloudinary (e.g., "data:image/png;base64,...")
     const prefixedFileData = fileData.startsWith('data:') ? fileData : `${mimeType ? `data:${mimeType}` : 'data:application/octet-stream'};base64,${fileData}`;
 
     try {
-        // 🏆 CRITICAL CHANGE: Call the updated helper to get URL AND OCR result
+        // 🏆 CRITICAL CHANGE: Get URL AND OCR result
         const { url: fileUrl, ocr_result } = await uploadDocumentToCloudinary(prefixedFileData, userId, docType);
         
         // Data structure to save to Firestore's 'applications_files' collection
         const documentInfo = {
             url: fileUrl,
-            // We now store the OCR result alongside the URL
-            ocr_result: ocr_result, 
+            ocr_result: ocr_result, // <-- OCR result is now included here
             filename: filename || `${docType}_file`,
             type: mimeType || 'application/octet-stream',
             uploadedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -317,12 +304,11 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
         userId, 
         studentId, 
         applicationData, 
-        documents: documentsToUpload // This should be an object containing docType: { fileData, filename, mimeType }
+        documents: documentsToUpload 
     } = req.body;
 
     const authenticatedUserId = req.user.uid; 
     
-    // Check if the user ID from the token matches the ID sent in the request
     if (authenticatedUserId !== userId || authenticatedUserId !== studentId) {
         return res.status(403).json({ success: false, message: "Unauthorized submission: User ID mismatch." });
     }
@@ -332,7 +318,6 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
     }
     
     let uploadedDocuments = {};
-    // ⚠️ CRITICAL FIX: Get the Firestore document reference (and ID) BEFORE the loop
     const newAppRef = firestoreDb.collection('scholarship_applications').doc(); 
     const applicationId = newAppRef.id;
 
@@ -342,10 +327,9 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
             const { fileData, filename, mimeType } = documentsToUpload[docType];
             
             if (fileData) {
-                // IMPORTANT: Ensure the Base64 data is correctly formatted
                 const prefixedFileData = fileData.startsWith('data:') ? fileData : `${mimeType ? `data:${mimeType}` : 'data:application/octet-stream'};base64,${fileData}`;
                 
-                // 🏆 CRITICAL CHANGE: Call the updated helper
+                // 🏆 CRITICAL CHANGE: Call the updated helper to get URL AND OCR result
                 const { url: fileUrl, ocr_result } = await uploadDocumentToCloudinary(prefixedFileData, userId, docType);
                 
                 uploadedDocuments[docType] = {
@@ -359,23 +343,19 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
         }
         
         // --- 2. Save Document URLs and OCR Data to applications_files collection ---
-        // This stores ALL uploaded files and their OCR data for the user under their UID
         await saveApplicationFilesToFirestore(userId, uploadedDocuments);
 
         // --- 3. Save Main Application Data to scholarship_applications collection ---
         const finalApplicationData = {
             ...applicationData,
-            applicationId: applicationId, // Use the generated ID
+            applicationId: applicationId, 
             userId,
-            studentId, // studentId is often the same as userId/UID
-            // IMPORTANT: Ensure 'middleName' is saved correctly if available
+            studentId, 
             middleName: applicationData.middleName || null,
             status: applicationData.status || "Submitted",
             submittedAt: admin.firestore.FieldValue.serverTimestamp()
-            // NOTE: Documents are referenced via the applications_files collection
         };
         
-        // Use set to save the data using the pre-generated ID
         await newAppRef.set(finalApplicationData);
         
         // --- 4. Update the current_application tracker in Firestore ---
@@ -391,15 +371,11 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
             success: true,
             message: "Application, documents, and OCR analysis submitted successfully.",
             applicationId: applicationId,
-            // Return the final data which includes the determined status
             applicationData: finalApplicationData, 
         });
 
     } catch (error) {
-        // 💥 CRITICAL: Log the detailed error to the server console
         console.error("💥 Application submission failed with Cloudinary/Firestore error:", error); 
-        
-        // Send a proper JSON error response back to the client
         res.status(500).json({ 
             success: false, 
             message: "Application submission failed due to a server or file upload error.",
@@ -410,25 +386,17 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
 
 // 1️⃣ REGISTER
 app.post('/api/register', async (req, res) => {
-    // Ensure all required fields are present
     const { firstName, middleName, lastName, course, yearLevel, email, password } = req.body;
-    if (!email || !password) {
-        return res.status(400).json({ success: false, message: "Email and password required." });
-    }
+    if (!email || !password) return res.status(400).json({ success: false, message: "Email and password required." });
 
-    // Use a placeholder UID/studentNo (e.g., Firestore doc ID) since the client doesn't provide it
     const generatedStudentNo = admin.firestore().collection('students').doc().id; 
     
     try {
-        // Check for existing user in MongoDB
-        if (await studentsCollection.findOne({ email })) {
-            return res.status(409).json({ success: false, message: "Email already registered." });
-        }
+        if (await studentsCollection.findOne({ email })) return res.status(409).json({ success: false, message: "Email already registered." });
 
         const verificationCode = generateVerificationCode();
         const codeExpiresAt = new Date(Date.now() + 15 * 60 * 1000);
 
-        // Create Firebase Auth user
         await admin.auth().createUser({
             uid: generatedStudentNo,
             email,
@@ -437,13 +405,11 @@ app.post('/api/register', async (req, res) => {
             emailVerified: false
         });
 
-        // Hash password for MongoDB storage
         const hashedPassword = await bcrypt.hash(password, saltRounds);
 
-        // Insert into MongoDB
         await studentsCollection.insertOne({
             firstName, 
-            middleName, // Updated field name
+            middleName, 
             lastName, 
             studentNo: generatedStudentNo,
             course, yearLevel, email,
@@ -459,7 +425,6 @@ app.post('/api/register', async (req, res) => {
 
         res.json({ success: true, message: "Registration successful. Verification code sent.", needsVerification: true });
     } catch (error) {
-        // Handle Firebase/MongoDB creation errors
         console.error("Registration error:", error);
         res.status(500).json({ success: false, message: "Registration failed." });
     }
@@ -478,13 +443,9 @@ app.post('/api/login-and-sync', async (req, res) => {
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) return res.status(401).json({ success: false, message: "Invalid email or password." });
 
-        // Sync MongoDB user data to Firebase Auth and Firestore
         const firebaseUid = await syncUserToFirebase(user);
-        
-        // Create custom token for client-side Firebase Auth
         const token = await admin.auth().createCustomToken(firebaseUid);
 
-        // Return necessary user data and custom token
         res.json({
             success: true,
             message: "Login successful.",
@@ -492,7 +453,7 @@ app.post('/api/login-and-sync', async (req, res) => {
                 studentNo: user.studentNo,
                 firebaseUid,
                 firstName: user.firstName,
-                middleName: user.middleName || null, // Ensure middleName is returned
+                middleName: user.middleName || null, 
                 lastName: user.lastName,
                 email,
                 role: user.role
@@ -522,15 +483,12 @@ app.post('/api/verify-code', async (req, res) => {
             return res.status(400).json({ success: false, message: "Code expired. Request new code." });
         }
 
-        // 1. Update MongoDB
         await studentsCollection.updateOne(
             { email },
             { $set: { isVerified: true, verifiedAt: new Date() }, $unset: { verificationCode: "", codeExpiresAt: "" } }
         );
 
-        // 2. Update Firebase Auth and Firestore
         await admin.auth().updateUser(user.studentNo, { emailVerified: true });
-        // Re-sync with the updated isVerified field
         await syncUserToFirebase({ ...user, isVerified: true }); 
 
         res.json({ success: true, message: "Email verified. You can log in.", userEmail: email });
@@ -589,7 +547,7 @@ app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
         const mongoResult = await studentsCollection.deleteOne({ email });
         mongoDeleted = mongoResult.deletedCount > 0;
 
-        // 2. Delete from Firebase Auth (using studentNo as the UID)
+        // 2. Delete from Firebase Auth
         try { 
             await admin.auth().deleteUser(studentNo); 
             authDeleted = true; 
@@ -598,12 +556,10 @@ app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
             console.warn("Firebase Auth deletion warning (user might not exist):", e.message);
         }
 
-        // 3. Delete from Firestore (using studentNo as the Document ID)
+        // 3. Delete from Firestore
         try {
             await firestoreDb.collection('students').doc(studentNo).delete();
-            // Assuming 'student_profiles' is another collection keyed by UID
             await firestoreDb.collection('student_profiles').doc(studentNo).delete();
-            // Delete the application files reference as well
             await firestoreDb.collection('applications_files').doc(studentNo).delete(); 
         } 
         catch (e) { 
@@ -632,7 +588,6 @@ async function initializeServer() {
         studentsCollection = db.collection(STUDENTS_COLLECTION);
         applicationsCollection = db.collection(APPLICATIONS_COLLECTION);
         
-        // Ensure indexes exist for fast lookups
         await studentsCollection.createIndex({ studentNo: 1 }, { unique: true });
         await studentsCollection.createIndex({ email: 1 }, { unique: true });
 

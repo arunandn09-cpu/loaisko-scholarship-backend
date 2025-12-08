@@ -69,7 +69,7 @@ async function syncUserToFirebase(user) {
     const { 
         email, 
         firstName, 
-        middleName, // middleInitial is now middleName
+        middleName, // middleName is the correct field
         lastName, 
         role, 
         course, 
@@ -108,7 +108,7 @@ async function syncUserToFirebase(user) {
         await firestoreDb.collection('students').doc(firebaseUid).set({
             studentNo: firebaseUid, // Ensure studentNo field matches UID
             firstName,
-            middleName,
+            middleName: middleName || null, // ✅ Ensure middleName is saved
             lastName,
             email,
             course,
@@ -155,13 +155,9 @@ async function uploadDocumentToCloudinary(fileData, userId, docType) {
 /**
  * Saves the Cloudinary URL and metadata to the dedicated applications_files collection.
  * This is the assumed logic based on your frontend fetching code (admin_documents.js).
- * NOTE: This function is primarily used for the INITIAL application submission 
- * where the document ID is the User ID.
  */
 async function saveApplicationFilesToFirestore(userId, documents) {
-    // This stores files keyed by the user's UID (Used in the submit-application route)
-    const fileDocRef = firestoreDb.collection('applications_files').doc(userId); 
-    
+    const fileDocRef = firestoreDb.collection('applications_files').doc(userId);
     // CRITICAL: Use set with merge true to update fields, or else it may overwrite the whole document
     await fileDocRef.set({
         userId: userId,
@@ -236,9 +232,18 @@ app.get('/', (req, res) => res.status(200).json({ message: "LOA ISKO API is runn
 
 app.get('/api/firebase-config', (req, res) => res.json(FIREBASE_CLIENT_CONFIG));
 
-// 7️⃣ NEW: DOCUMENT UPLOAD ROUTE (Standalone - for individual file submissions)
+// 7️⃣ UPDATED: DOCUMENT UPLOAD/RESUBMISSION ROUTE 
+// (Uses targetCollection to handle initial upload OR resubmission)
 app.post('/api/upload-document', verifyToken, async (req, res) => {
-    const { userId, fileData, docType, filename, mimeType } = req.body;
+    const { 
+        userId, 
+        fileData, 
+        docType, 
+        filename, 
+        mimeType,
+        // 🛑 CRITICAL CHANGE: Capture the collection name, default to 'applications_files'
+        targetCollection = 'applications_files' 
+    } = req.body;
 
     // Use the verified token's UID for security, not the body's userId
     const authenticatedUserId = req.user.uid; 
@@ -255,52 +260,39 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
     const prefixedFileData = fileData.startsWith('data:') ? fileData : `${mimeType ? `data:${mimeType}` : 'data:application/octet-stream'};base64,${fileData}`;
 
     try {
-        // --- 1. Find the Application ID ---
-        const currentAppSnap = await firestoreDb.collection('current_application').doc(userId).get();
-        const applicationId = currentAppSnap.exists ? currentAppSnap.data().applicationId : null;
-        
-        if (!applicationId) {
-            console.error("No active application found for user:", userId);
-            // Must return JSON error response
-            return res.status(404).json({ success: false, message: "No active application found to attach the resubmitted file." });
-        }
-        
-        // --- 2. Upload Document to Cloudinary ---
         const fileUrl = await uploadDocumentToCloudinary(prefixedFileData, userId, docType);
         
-        // --- 3. Prepare Document Metadata ---
+        // Data structure to save to Firestore. CRITICAL: Set verified to false on new upload.
         const documentInfo = {
             url: fileUrl,
+            data: null, // Clear Base64 data once URL is generated
             filename: filename || `${docType}_file`,
             type: mimeType || 'application/octet-stream',
-            verified: false, // CRITICAL: Reset verification status on resubmission
-            adminNote: "Resubmitted, awaiting re-review.",
-            uploadedAt: admin.firestore.FieldValue.serverTimestamp()
+            uploadedAt: admin.firestore.FieldValue.serverTimestamp(),
+            // 🛑 CRITICAL FIX: Mark as unverified upon re-upload
+            verified: false, 
+            adminNote: null, // Clear any previous admin note
         };
         
-        // --- 4. Atomically update the applications_files document using the APPLICATION ID ---
-        // 🛑 CRITICAL FIX: Use the Application ID, not the User ID, as the document ID
-        const fileDocRef = firestoreDb.collection('applications_files').doc(applicationId); 
+        // 🛑 CRITICAL FIX: Use the dynamic targetCollection for saving the file metadata
+        const fileDocRef = firestoreDb.collection(targetCollection).doc(userId);
 
-        // Use FieldValue.set to target the nested path 'documents.[docType]'
-        const updatePath = `documents.${docType}`;
-        const updateObject = {
-            userId: userId, // Keep the user ID field
-            [updatePath]: documentInfo
-        };
-        
-        await fileDocRef.set(updateObject, { merge: true });
+        await fileDocRef.set({
+            userId: userId,
+            documents: {
+                [docType]: documentInfo
+            }
+        }, { merge: true });
 
         res.json({ 
             success: true, 
-            message: `${docType} uploaded successfully.`,
+            message: `${docType} uploaded successfully to ${targetCollection}.`,
             documentInfo: documentInfo
         });
 
     } catch (error) {
         console.error(`Cloudinary upload or Firestore update error for ${docType}:`, error);
-        // CRITICAL: Ensure JSON response on failure
-        res.status(500).json({ success: false, message: `File upload failed for ${docType}.`, errorDetails: error.message });
+        res.status(500).json({ success: false, message: `File upload failed for ${docType}.` });
     }
 });
 
@@ -346,21 +338,14 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
                     // data: null, // IMPORTANT: The data field is no longer needed/used here
                     filename: filename || `${docType}_file`,
                     type: mimeType || 'application/octet-stream',
-                    verified: false, // Initial upload status
-                    adminNote: "",
                     uploadedAt: admin.firestore.FieldValue.serverTimestamp()
                 };
             }
         }
         
         // --- 2. Save Document URLs to applications_files collection ---
-        // NOTE: For the initial submission, the file document ID is the Application ID
-        const fileDocRef = firestoreDb.collection('applications_files').doc(applicationId);
-        await fileDocRef.set({
-            userId: userId,
-            documents: uploadedDocuments,
-            submittedAt: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
+        // This stores ALL uploaded files for the user under their UID
+        await saveApplicationFilesToFirestore(userId, uploadedDocuments);
 
         // --- 3. Save Main Application Data to scholarship_applications collection ---
         const finalApplicationData = {
@@ -368,7 +353,7 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
             applicationId: applicationId, // Use the generated ID
             userId,
             studentId, // studentId is often the same as userId/UID
-            // IMPORTANT: Ensure 'middleName' is saved correctly if available
+            // ✅ CRITICAL FIX: Ensure 'middleName' is saved correctly
             middleName: applicationData.middleName || null,
             status: applicationData.status || "Submitted",
             submittedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -443,7 +428,7 @@ app.post('/api/register', async (req, res) => {
         // Insert into MongoDB
         await studentsCollection.insertOne({
             firstName, 
-            middleName, // Updated field name
+            middleName: middleName || null, // ✅ Ensure middleName is stored correctly
             lastName, 
             studentNo: generatedStudentNo,
             course, yearLevel, email,
@@ -492,7 +477,7 @@ app.post('/api/login-and-sync', async (req, res) => {
                 studentNo: user.studentNo,
                 firebaseUid,
                 firstName: user.firstName,
-                middleName: user.middleName || null, // Ensure middleName is returned
+                middleName: user.middleName || null, // ✅ Ensure middleName is returned
                 lastName: user.lastName,
                 email,
                 role: user.role
@@ -604,12 +589,9 @@ app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
             // Assuming 'student_profiles' is another collection keyed by UID
             await firestoreDb.collection('student_profiles').doc(studentNo).delete();
             // Delete the application files reference as well
-            // NOTE: This delete should ideally iterate over all applications by this user 
-            // and delete the application_files document associated with each application ID.
-            // For now, we'll delete the user-keyed applications_files document if it exists.
-            // The original logic that used User ID as Document ID (which is still in the submit-application route) 
-            // should be reviewed, but for now we keep the studentNo delete here for backwards compatibility.
             await firestoreDb.collection('applications_files').doc(studentNo).delete(); 
+            // 🛑 NEW: Also delete the resubmission files reference
+            await firestoreDb.collection('resubmission_files').doc(studentNo).delete(); 
         } 
         catch (e) { 
             console.warn("Firestore deletion warning (doc might not exist):", e.message); 

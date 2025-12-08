@@ -152,12 +152,9 @@ async function uploadDocumentToCloudinary(fileData, userId, docType) {
 
 /**
  * Saves the Cloudinary URL and metadata to the dedicated applications_files collection.
- * 🚨 NOTE: This is only used by the INITIAL submission route. The upload-document route
- * handles resubmission logic dynamically.
  */
 async function saveApplicationFilesToFirestore(applicationId, userId, documents) {
-    // 🛑 CRITICAL FIX: The document key for the checklist must be the Application ID (applicationId),
-    // not the userId, to match the frontend read logic and security rules.
+    // CRITICAL FIX: The document key for the checklist must be the Application ID (applicationId)
     const fileDocRef = firestoreDb.collection('applications_files').doc(applicationId); 
     
     await fileDocRef.set({
@@ -233,7 +230,6 @@ app.get('/', (req, res) => res.status(200).json({ message: "LOA ISKO API is runn
 app.get('/api/firebase-config', (req, res) => res.json(FIREBASE_CLIENT_CONFIG));
 
 // 7️⃣ UPDATED: DOCUMENT UPLOAD/RESUBMISSION ROUTE 
-// (Uses targetCollection to handle initial upload OR resubmission)
 app.post('/api/upload-document', verifyToken, async (req, res) => {
     const { 
         userId, 
@@ -241,7 +237,7 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
         docType, 
         filename, 
         mimeType,
-        // 🛑 CRITICAL: Capture the collection name. If resubmitting, this should be "resubmission_files"
+        // CRITICAL: Capture the collection name. If resubmitting, this should be "resubmission_files"
         targetCollection = 'applications_files',
         // Optional: Capture the Application ID if available (needed for initial checklist doc ID)
         applicationId 
@@ -258,7 +254,7 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
         return res.status(400).json({ success: false, message: "Missing required file upload parameters." });
     }
     
-    // Ensure the file data is properly prefixed for Cloudinary (e.g., "data:image/png;base64,...")
+    // Ensure the file data is properly prefixed for Cloudinary
     const prefixedFileData = fileData.startsWith('data:') ? fileData : `${mimeType ? `data:${mimeType}` : 'data:application/octet-stream'};base64,${fileData}`;
 
     try {
@@ -271,7 +267,7 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
             filename: filename || `${docType}_file`,
             type: mimeType || 'application/octet-stream',
             uploadedAt: admin.firestore.FieldValue.serverTimestamp(),
-            // CRITICAL FIX: Mark as unverified upon re-upload
+            // CRITICAL: Mark as unverified upon re-upload
             verified: false, 
             adminNote: null, 
         };
@@ -279,16 +275,13 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
         // 🛑 CRITICAL: Determine the Firestore Document ID based on the target collection
         let docId;
         if (targetCollection === 'applications_files') {
-            // For initial submission (which uses this route for files), the ID should be the Application ID
-            // NOTE: If using this route for initial submission, you must pass applicationId in the body.
-            // However, the standard initial submission uses /api/submit-application, which is safer.
-            // FALLBACK FOR RESUBMISSION: Use userId as the document ID for 'resubmission_files'
+            // For initial submission, the ID should be the Application ID (if passed)
             docId = applicationId || userId;
         } else if (targetCollection === 'resubmission_files') {
             // Document ID for resubmission files is the user's UID (userId)
             docId = userId;
         } else {
-            // Default or error fallback
+            // Default 
             docId = userId;
         }
 
@@ -362,7 +355,6 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
         }
         
         // --- 2. Save Document URLs to applications_files collection ---
-        // 🛑 CRITICAL FIX: Pass the applicationId here for the document ID
         await saveApplicationFilesToFirestore(applicationId, userId, uploadedDocuments);
 
         // --- 3. Save Main Application Data to scholarship_applications collection ---
@@ -599,12 +591,6 @@ app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
         try {
             await firestoreDb.collection('students').doc(studentNo).delete();
             await firestoreDb.collection('student_profiles').doc(studentNo).delete();
-            // Delete the application files reference as well
-            // NOTE: This assumes the initial application file checklist is keyed by studentNo/UID, 
-            // but it should be keyed by applicationId based on our previous fixes.
-            // This deletion might be incomplete if multiple checklists exist.
-            
-            // 🛑 NEW: Also delete the resubmission files reference (keyed by UID/studentNo)
             await firestoreDb.collection('resubmission_files').doc(studentNo).delete(); 
         } 
         catch (e) { 
@@ -618,6 +604,27 @@ app.delete('/api/admin/delete-student', verifyAdmin, async (req, res) => {
         console.error("Deletion error:", error);
         res.status(500).json({ success: false, message: "Deletion failed." });
     }
+});
+
+// 🛑 NEW: Global 404 Handler (must be the last route)
+// If no route handled the request, return JSON 404
+app.use((req, res, next) => {
+    res.status(404).json({ 
+        success: false, 
+        message: "API endpoint not found. Check your URL path and routing configuration." 
+    });
+});
+
+// 🛑 NEW: Global Error Handler (must have 4 arguments)
+// Catches unhandled errors/crashes and forces a JSON response
+app.use((err, req, res, next) => {
+    console.error("🔥 GLOBAL SERVER CRASH:", err.stack);
+    // Ensure all crashes return JSON
+    res.status(500).json({ 
+        success: false, 
+        message: "Internal server error due to unhandled exception.", 
+        error: err.message 
+    });
 });
 
 // --- INITIALIZATION ---

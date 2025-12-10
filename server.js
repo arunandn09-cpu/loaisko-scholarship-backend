@@ -256,7 +256,6 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
     }
     
     // 🛑 CRITICAL FIX 1: Ensure Base64 is properly prefixed if it's not already.
-    // The client should ideally send the full string, but we safeguard here.
     let prefixedFileData = fileData;
     if (!fileData.startsWith('data:')) {
         // Assuming fileData is JUST the base64 content
@@ -272,7 +271,7 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
             url: fileUrl,
             data: null, 
             filename: filename || `${docType}_file`,
-            type: mimeType || 'image/jpeg', // Defaulted to image type since your images show images being uploaded
+            type: mimeType || 'image/jpeg', 
             uploadedAt: admin.firestore.FieldValue.serverTimestamp(),
             // CRITICAL: Mark as unverified upon re-upload
             verified: false, 
@@ -285,7 +284,6 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
         if (targetCollection === 'resubmission_files') {
             // CRITICAL FIX: The document ID for resubmission_files MUST be the APPLICATION ID.
             if (!applicationId) {
-                // Log error and reject if Application ID is missing for resubmission
                 console.error("Missing Application ID for resubmission attempt by user:", userId);
                 return res.status(400).json({ success: false, message: "Missing Application ID for file resubmission." });
             }
@@ -301,7 +299,6 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
         const fileDocRef = firestoreDb.collection(targetCollection).doc(docId);
 
         // This will create a document with the structure { userId, documents: { docType: documentInfo } }
-        // and MERGE it, preserving other document types if they exist in the 'documents' map.
         await fileDocRef.set({
             userId: userId,
             documents: {
@@ -318,14 +315,14 @@ app.post('/api/upload-document', verifyToken, async (req, res) => {
         });
 
     } catch (error) {
-        // 🔥 Server Error Logging (Ensures the error is visible in Render logs)
+        // 🔥 Server Error Logging
         console.error(`💥 Cloudinary upload or Firestore update failed for ${docType}:`, error); 
         
         // Ensure this returns JSON 500 status to client
         res.status(500).json({ 
             success: false, 
             message: `File upload failed for ${docType}. Server error.`,
-            errorDetails: error.message // Include error message for better client-side debugging
+            errorDetails: error.message 
         });
     }
 });
@@ -393,8 +390,6 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
             studentId, 
             middleName: applicationData.middleName || null,
             status: applicationData.status || "Submitted",
-            // NEW: Initialize verificationSnapshots map
-            verificationSnapshots: {}, 
             submittedAt: admin.firestore.FieldValue.serverTimestamp()
         };
         
@@ -427,88 +422,84 @@ app.post('/api/submit-application', verifyToken, async (req, res) => {
     }
 });
 
-
-// 9️⃣ NEW: ADMIN STATUS, COMMENT, AND DOCUMENT VERIFICATION UPDATE ROUTE
+// 9️⃣ ADMIN: UPDATE APPLICATION STATUS (CRITICAL NEW ROUTE FOR VERIFICATION SNAPSHOTS)
 app.post('/api/admin/update-application-status', verifyAdmin, async (req, res) => {
     const { 
         docId, 
         newStatus, 
         adminComment, 
-        selectedPendingRemarks, 
-        documentVerificationUpdates, // ONLY contains UNLOCKED/MODIFIED verification data
-        oldStatus // CRITICAL: The status the application was in before this update
+        selectedPendingRemarks = [], 
+        documentVerificationUpdates = {}, 
+        oldStatus 
     } = req.body;
 
-    if (!docId || !newStatus) {
-        return res.status(400).json({ success: false, message: "Missing application ID or new status." });
+    if (!docId || !newStatus || !oldStatus) {
+        return res.status(400).json({ success: false, message: "Missing required fields (docId, newStatus, oldStatus)." });
     }
 
+    const applicationRef = firestoreDb.collection('scholarship_applications').doc(docId);
+    
+    // --- 1. Prepare Updates for Main Application Document ---
+    const updatePayload = {
+        status: newStatus,
+        adminComment: adminComment || null,
+        pendingRemarks: selectedPendingRemarks, // Saved regardless of status for history
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    };
+    
+    // --- 2. Handle Document Verification Snapshots via Transaction ---
+    let currentData = {};
     try {
-        const appDocRef = firestoreDb.collection('scholarship_applications').doc(docId);
-        const appSnap = await appDocRef.get();
-
-        if (!appSnap.exists) {
-            return res.status(404).json({ success: false, message: "Application not found." });
-        }
-        
-        const currentData = appSnap.data();
-        const currentStatus = currentData.status || "Submitted";
-        
-        // --- 1. Prepare the Update Payload ---
-        const updatePayload = {
-            status: newStatus,
-            adminComment: adminComment || null,
-            pendingRemarks: selectedPendingRemarks || [],
-            updatedAt: admin.firestore.FieldValue.serverTimestamp()
-        };
-
-        // --- 2. Implement Verification Snapshot Logic ---
-        
-        // Only proceed if there is verification data to save
-        if (Object.keys(documentVerificationUpdates).length > 0) {
-            let snapshotKeyToUpdate = currentStatus; // Default: save iteratively against current status
-
-            // If the status is definitively changing, save the verification state against the OLD status.
-            if (oldStatus && oldStatus !== newStatus) {
-                snapshotKeyToUpdate = oldStatus;
-            } else {
-                // If the client didn't provide oldStatus or status isn't changing, use the current status.
-                // This ensures verification data is still saved for the current stage.
-                snapshotKeyToUpdate = currentStatus; 
+        await firestoreDb.runTransaction(async (transaction) => {
+            const docSnapshot = await transaction.get(applicationRef);
+            if (!docSnapshot.exists) {
+                throw new Error("Application not found.");
+            }
+            currentData = docSnapshot.data();
+            const currentSnapshots = currentData.verificationSnapshots || {};
+            
+            // Check if there are verification updates sent from the client
+            if (Object.keys(documentVerificationUpdates).length > 0) {
+                
+                // CRITICAL: We save the document verification data using the OLD STATUS as the key.
+                const snapshotKey = oldStatus;
+                
+                // Merge new updates with the existing snapshot for the old status
+                const existingSnapshot = currentSnapshots[snapshotKey] || {};
+                
+                // Merge the existing snapshot with the new verification updates
+                currentSnapshots[snapshotKey] = {
+                    ...existingSnapshot,
+                    ...documentVerificationUpdates
+                };
+                
+                // Add the updated snapshots object to the main update payload
+                updatePayload.verificationSnapshots = currentSnapshots;
             }
             
-            // Construct the Firestore update path for the nested map
-            const firestorePath = `verificationSnapshots.${snapshotKeyToUpdate}`;
-            
-            // Merge the new verification data into the specific snapshot key.
-            updatePayload[firestorePath] = documentVerificationUpdates;
+            // --- 3. Update the Document ---
+            transaction.update(applicationRef, updatePayload);
+        });
+
+        // 4. Update the current_application tracker (if applicable)
+        if (currentData.userId) {
+            const currentAppRef = firestoreDb.collection('current_application').doc(currentData.userId);
+            await currentAppRef.update({
+                status: newStatus,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
         }
 
-        // --- 3. Execute Firestore Update ---
-        await appDocRef.update(updatePayload);
-
-        // --- 4. Send Status Email (Optional but recommended) ---
-        if (currentData.email && currentData.firstName && currentData.scholarshipType) {
-            await sendApplicationStatusEmail(
-                currentData.email, 
-                `${currentData.firstName} ${currentData.lastName}`, 
-                currentData.scholarshipType, 
-                newStatus
-            );
-        }
-
-        res.status(200).json({
-            success: true,
-            message: `Application status updated to ${newStatus}.`
+        res.status(200).json({ 
+            success: true, 
+            message: `Application status updated to ${newStatus}.`,
+            verificationSaved: Object.keys(documentVerificationUpdates).length > 0,
+            newStatus: newStatus
         });
 
     } catch (error) {
-        console.error("💥 Admin status update failed:", error); 
-        res.status(500).json({ 
-            success: false, 
-            message: "Failed to update application status and verification data.",
-            errorDetails: error.message
-        });
+        console.error("💥 Transactional update failed for application status:", error);
+        res.status(500).json({ success: false, message: "Server failed to update application status and verification details." });
     }
 });
 
